@@ -4,6 +4,7 @@
 #include "Playerbots.h"
 #include "PlayerScript.h"
 #include "ScriptMgr.h"
+#include "TravelMgr.h"
 
 #include <unordered_map>
 
@@ -30,6 +31,42 @@ namespace
 
         state.lastCheckMs = now;
         return true;
+    }
+
+    bool IsLowValueTarget(TravelDestination* destination)
+    {
+        return dynamic_cast<NullTravelDestination*>(destination) ||
+               dynamic_cast<GrindTravelDestination*>(destination) ||
+               dynamic_cast<ExploreTravelDestination*>(destination);
+    }
+
+    bool IsUsableTarget(Player* bot, TravelTarget* target)
+    {
+        if (!target || !target->getDestination())
+            return false;
+
+        if (target->getStatus() == TRAVEL_STATUS_EXPIRED || !target->isActive())
+            return false;
+
+        return target->getDestination()->isActive(bot);
+    }
+
+    bool ShouldNudge(Player* bot, TravelTarget* current)
+    {
+        if (!current)
+            return false;
+
+        if (current->isForced() || current->isGroupCopy())
+            return false;
+
+        TravelDestination* destination = current->getDestination();
+        if (!destination || IsLowValueTarget(destination))
+            return true;
+
+        if (dynamic_cast<RpgTravelDestination*>(destination))
+            return false;
+
+        return !IsUsableTarget(bot, current);
     }
 
     void LogCandidate(Player* bot, LazyBotState& state, LazyQuestCandidate const& candidate)
@@ -71,14 +108,37 @@ public:
             return;
 
         LazyQuestCandidate candidate;
-        if (FindLazyQuestCandidate(player, candidate))
-            LogCandidate(player, state, candidate);
-        else
+        if (!FindLazyQuestCandidate(player, candidate))
         {
             state.lastQuestId = 0;
             state.lastDestination = nullptr;
             state.lastPoint = nullptr;
+            return;
         }
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+        TravelTarget* current = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+
+        if (!ShouldNudge(player, current))
+        {
+            LogCandidate(player, state, candidate);
+            return;
+        }
+
+        std::string oldTarget = "none";
+        if (current && current->getDestination())
+            oldTarget = current->getDestination()->getName();
+
+        current->setTarget(candidate.destination, candidate.point);
+
+        state.lastQuestId = candidate.questId;
+        state.lastDestination = candidate.destination;
+        state.lastPoint = candidate.point;
+
+        Quest const* quest = candidate.destination->GetQuestTemplate();
+        LOG_INFO("playerbots", "[LQ] {}: {} -> quest {} [{}] ({}) at {:.0f}y", player->GetName(), oldTarget,
+                 candidate.questId, quest ? quest->GetTitle() : "<unknown>", candidate.destination->getTitle(),
+                 candidate.distance);
     }
 };
 
