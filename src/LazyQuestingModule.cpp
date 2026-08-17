@@ -134,13 +134,16 @@ namespace
         return completed == intent.completed;
     }
 
-    void AcquireStrategyOwnership(PlayerbotAI* botAI, LazyBotState& state)
+    void AcquireStrategyOwnership(Player* bot, PlayerbotAI* botAI, LazyBotState& state)
     {
         if (state.strategyOwnershipActive)
             return;
 
-        state.addedTravelStrategy = !botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT);
-        state.removedNewRpgStrategy = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        bool hadTravel = botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT);
+        bool hadNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+
+        state.addedTravelStrategy = !hadTravel;
+        state.removedNewRpgStrategy = hadNewRpg;
 
         if (state.addedTravelStrategy)
             botAI->ChangeStrategy("+travel", BOT_STATE_NON_COMBAT);
@@ -149,18 +152,35 @@ namespace
             botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
 
         state.strategyOwnershipActive = true;
+
+        LOG_INFO("playerbots",
+                 "[LQ] {} took movement control: travel {} -> {}, new-rpg {} -> {}, rpg-status {}",
+                 bot->GetName(), hadTravel ? "on" : "off",
+                 botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT) ? "on" : "off",
+                 hadNewRpg ? "on" : "off",
+                 botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ? "on" : "off",
+                 static_cast<uint32>(botAI->rpgInfo.GetStatus()));
     }
 
-    void ReleaseStrategyOwnership(PlayerbotAI* botAI, LazyBotState& state)
+    void ReleaseStrategyOwnership(Player* bot, PlayerbotAI* botAI, LazyBotState& state)
     {
         if (!state.strategyOwnershipActive)
             return;
 
-        if (state.addedTravelStrategy && botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT))
+        bool removedTravel = state.addedTravelStrategy && botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT);
+        bool restoredNewRpg = state.removedNewRpgStrategy && !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+
+        if (removedTravel)
             botAI->ChangeStrategy("-travel", BOT_STATE_NON_COMBAT);
 
-        if (state.removedNewRpgStrategy && !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+        if (restoredNewRpg)
             botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+
+        LOG_INFO("playerbots",
+                 "[LQ] {} released movement control: travel={}, new-rpg={}, restored travel={}, restored new-rpg={}",
+                 bot->GetName(), botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT) ? "on" : "off",
+                 botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ? "on" : "off",
+                 removedTravel ? "yes" : "no", restoredNewRpg ? "yes" : "no");
 
         state.strategyOwnershipActive = false;
         state.addedTravelStrategy = false;
@@ -174,7 +194,7 @@ namespace
 
         LOG_INFO("playerbots", "[LQ] {} released quest {} intent ({})", bot->GetName(), state.intent.questId, reason);
         state.intent.Clear();
-        ReleaseStrategyOwnership(botAI, state);
+        ReleaseStrategyOwnership(bot, botAI, state);
     }
 
     void AcquireIntent(Player* bot, PlayerbotAI* botAI, LazyBotState& state, LazyQuestCandidate const& candidate, uint32 now)
@@ -188,7 +208,7 @@ namespace
         state.intent.destination = candidate.destination;
         state.intent.point = candidate.point;
 
-        AcquireStrategyOwnership(botAI, state);
+        AcquireStrategyOwnership(bot, botAI, state);
 
         Quest const* quest = candidate.destination->GetQuestTemplate();
         LOG_INFO("playerbots", "[LQ] {} acquired quest {} [{}] intent ({}) at {:.0f}y", bot->GetName(),
