@@ -18,10 +18,22 @@ namespace
     constexpr uint32 FAILED_QUEST_COOLDOWN_MS = 20 * MINUTE * IN_MILLISECONDS;
     constexpr float TRAVEL_PROGRESS_YARDS = 50.0f;
 
+    char const* IntentTypeName(LazyQuestIntentType type)
+    {
+        switch (type)
+        {
+            case LazyQuestIntentType::TurnIn:
+                return "turn-in";
+            case LazyQuestIntentType::DoQuest:
+            default:
+                return "do-quest";
+        }
+    }
+
     struct LazyQuestIntent
     {
         uint32 questId = 0;
-        bool completed = false;
+        LazyQuestIntentType type = LazyQuestIntentType::DoQuest;
         uint32 startedAtMs = 0;
         uint32 lastProgressAtMs = 0;
         uint64 progressFingerprint = 0;
@@ -34,7 +46,7 @@ namespace
         void Clear()
         {
             questId = 0;
-            completed = false;
+            type = LazyQuestIntentType::DoQuest;
             startedAtMs = 0;
             lastProgressAtMs = 0;
             progressFingerprint = 0;
@@ -130,8 +142,10 @@ namespace
         if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
             return false;
 
-        bool completed = status == QUEST_STATUS_COMPLETE;
-        return completed == intent.completed;
+        LazyQuestIntentType currentType = status == QUEST_STATUS_COMPLETE
+            ? LazyQuestIntentType::TurnIn
+            : LazyQuestIntentType::DoQuest;
+        return currentType == intent.type;
     }
 
     void AcquireStrategyOwnership(Player* bot, PlayerbotAI* botAI, LazyBotState& state)
@@ -192,7 +206,8 @@ namespace
         if (!state.intent.IsActive())
             return;
 
-        LOG_INFO("playerbots", "[LQ] {} released quest {} intent ({})", bot->GetName(), state.intent.questId, reason);
+        LOG_INFO("playerbots", "[LQ] {} released {} quest {} intent ({})", bot->GetName(),
+                 IntentTypeName(state.intent.type), state.intent.questId, reason);
         state.intent.Clear();
         ReleaseStrategyOwnership(bot, botAI, state);
     }
@@ -200,7 +215,7 @@ namespace
     void AcquireIntent(Player* bot, PlayerbotAI* botAI, LazyBotState& state, LazyQuestCandidate const& candidate, uint32 now)
     {
         state.intent.questId = candidate.questId;
-        state.intent.completed = candidate.completed;
+        state.intent.type = candidate.type;
         state.intent.startedAtMs = now;
         state.intent.lastProgressAtMs = now;
         state.intent.progressFingerprint = GetQuestProgressFingerprint(bot, candidate.questId);
@@ -211,9 +226,9 @@ namespace
         AcquireStrategyOwnership(bot, botAI, state);
 
         Quest const* quest = candidate.destination->GetQuestTemplate();
-        LOG_INFO("playerbots", "[LQ] {} acquired quest {} [{}] intent ({}) at {:.0f}y", bot->GetName(),
-                 candidate.questId, quest ? quest->GetTitle() : "<unknown>",
-                 candidate.completed ? "turn-in" : "objective", candidate.distance);
+        LOG_INFO("playerbots", "[LQ] {} acquired {} quest {} [{}] intent at {:.0f}y", bot->GetName(),
+                 IntentTypeName(candidate.type), candidate.questId, quest ? quest->GetTitle() : "<unknown>",
+                 candidate.distance);
     }
 
     void MaintainIntent(Player* bot, LazyBotState& state, TravelTarget* current)
@@ -225,7 +240,8 @@ namespace
             return;
 
         current->setTarget(state.intent.destination, state.intent.point);
-        LOG_INFO("playerbots", "[LQ] {} restored quest {} travel target", bot->GetName(), state.intent.questId);
+        LOG_INFO("playerbots", "[LQ] {} restored {} quest {} travel target", bot->GetName(),
+                 IntentTypeName(state.intent.type), state.intent.questId);
     }
 
     void UpdateIntentProgress(Player* bot, LazyQuestIntent& intent, uint32 now)

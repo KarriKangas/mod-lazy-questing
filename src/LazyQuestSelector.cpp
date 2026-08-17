@@ -53,14 +53,20 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
             if (distance > MAX_QUEST_DISTANCE)
                 continue;
 
-            bool const completed = questStatus.Status == QUEST_STATUS_COMPLETE;
-            if (found && (candidate.completed && !completed || candidate.completed == completed && candidate.distance <= distance))
+            LazyQuestIntentType const type = questStatus.Status == QUEST_STATUS_COMPLETE
+                ? LazyQuestIntentType::TurnIn
+                : LazyQuestIntentType::DoQuest;
+            bool const candidateIsTurnIn = candidate.type == LazyQuestIntentType::TurnIn;
+            bool const currentIsTurnIn = type == LazyQuestIntentType::TurnIn;
+
+            if (found && (candidateIsTurnIn && !currentIsTurnIn ||
+                          candidateIsTurnIn == currentIsTurnIn && candidate.distance <= distance))
                 continue;
 
             candidate.destination = destination;
             candidate.point = point;
             candidate.questId = questId;
-            candidate.completed = completed;
+            candidate.type = type;
             candidate.distance = distance;
             found = true;
         }
