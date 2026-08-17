@@ -4,9 +4,39 @@
 #include "QuestDef.h"
 #include "TravelMgr.h"
 
+#include <vector>
+
 namespace
 {
     constexpr float MAX_QUEST_DISTANCE = 2500.0f;
+    constexpr float QUEST_CLUSTER_RADIUS = 400.0f;
+
+    struct RankedQuestCandidate
+    {
+        LazyQuestCandidate candidate;
+        WorldPosition* clusterPoint = nullptr;
+    };
+
+    uint32 CountNearbyQuestWork(RankedQuestCandidate const& current,
+                                std::vector<RankedQuestCandidate> const& candidates)
+    {
+        uint32 count = 1;
+
+        for (RankedQuestCandidate const& other : candidates)
+        {
+            if (&other == &current || other.candidate.type != LazyQuestIntentType::DoQuest)
+                continue;
+
+            if (!current.clusterPoint || !other.clusterPoint ||
+                current.clusterPoint->GetMapId() != other.clusterPoint->GetMapId())
+                continue;
+
+            if (current.clusterPoint->distance(other.clusterPoint) <= QUEST_CLUSTER_RADIUS)
+                ++count;
+        }
+
+        return count;
+    }
 }
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
@@ -16,7 +46,7 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
         return false;
 
     WorldPosition botPosition(bot);
-    bool found = false;
+    std::vector<RankedQuestCandidate> candidates;
 
     for (auto const& quest : bot->getQuestStatusMap())
     {
@@ -53,24 +83,61 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
             if (distance > MAX_QUEST_DISTANCE)
                 continue;
 
-            LazyQuestIntentType const type = questStatus.Status == QUEST_STATUS_COMPLETE
+            RankedQuestCandidate ranked;
+            ranked.candidate.destination = destination;
+            ranked.candidate.point = point;
+            ranked.candidate.questId = questId;
+            ranked.candidate.type = questStatus.Status == QUEST_STATUS_COMPLETE
                 ? LazyQuestIntentType::TurnIn
                 : LazyQuestIntentType::DoQuest;
-            bool const candidateIsTurnIn = candidate.type == LazyQuestIntentType::TurnIn;
-            bool const currentIsTurnIn = type == LazyQuestIntentType::TurnIn;
-
-            if (found && (candidateIsTurnIn && !currentIsTurnIn ||
-                          candidateIsTurnIn == currentIsTurnIn && candidate.distance <= distance))
-                continue;
-
-            candidate.destination = destination;
-            candidate.point = point;
-            candidate.questId = questId;
-            candidate.type = type;
-            candidate.distance = distance;
-            found = true;
+            ranked.candidate.distance = distance;
+            ranked.clusterPoint = destination->nearestPoint(&botPosition);
+            candidates.push_back(ranked);
         }
     }
 
-    return found;
+    if (candidates.empty())
+        return false;
+
+    // Turning in completed quests remains the highest priority. Keep the old behavior: nearest turn-in wins.
+    RankedQuestCandidate const* nearestTurnIn = nullptr;
+    for (RankedQuestCandidate const& current : candidates)
+    {
+        if (current.candidate.type != LazyQuestIntentType::TurnIn)
+            continue;
+
+        if (!nearestTurnIn || current.candidate.distance < nearestTurnIn->candidate.distance)
+            nearestTurnIn = &current;
+    }
+
+    if (nearestTurnIn)
+    {
+        candidate = nearestTurnIn->candidate;
+        return true;
+    }
+
+    // For unfinished quests, prefer destinations surrounded by other useful quest work.
+    // At the tiny candidate counts in a quest log, the simple O(n^2) scan is plenty.
+    RankedQuestCandidate const* bestQuestWork = nullptr;
+    uint32 bestClusterSize = 0;
+
+    for (RankedQuestCandidate const& current : candidates)
+    {
+        if (current.candidate.type != LazyQuestIntentType::DoQuest)
+            continue;
+
+        uint32 const clusterSize = CountNearbyQuestWork(current, candidates);
+        if (!bestQuestWork || clusterSize > bestClusterSize ||
+            (clusterSize == bestClusterSize && current.candidate.distance < bestQuestWork->candidate.distance))
+        {
+            bestQuestWork = &current;
+            bestClusterSize = clusterSize;
+        }
+    }
+
+    if (!bestQuestWork)
+        return false;
+
+    candidate = bestQuestWork->candidate;
+    return true;
 }
