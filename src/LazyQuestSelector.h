@@ -3,6 +3,8 @@
 
 #include "Define.h"
 
+#include <unordered_set>
+
 class Player;
 class TravelDestination;
 class WorldPosition;
@@ -16,6 +18,7 @@ struct LazyQuestCandidate
     float distance = 0.0f;
 };
 
-bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate);
+bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
+                            std::unordered_set<uint32> const* excludedQuestIds = nullptr);
 
 #endif

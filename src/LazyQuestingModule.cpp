@@ -7,18 +7,25 @@
 #include "TravelMgr.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "LazyQuestSelector.h"
 
 namespace
 {
     constexpr uint32 CHECK_INTERVAL_MS = 3 * IN_MILLISECONDS;
+    constexpr uint32 NO_PROGRESS_TIMEOUT_MS = 5 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 FAILED_QUEST_COOLDOWN_MS = 20 * MINUTE * IN_MILLISECONDS;
+    constexpr float TRAVEL_PROGRESS_YARDS = 50.0f;
 
     struct LazyQuestIntent
     {
         uint32 questId = 0;
         bool completed = false;
         uint32 startedAtMs = 0;
+        uint32 lastProgressAtMs = 0;
+        uint64 progressFingerprint = 0;
+        float lastDistance = 0.0f;
         TravelDestination* destination = nullptr;
         WorldPosition* point = nullptr;
 
@@ -29,6 +36,9 @@ namespace
             questId = 0;
             completed = false;
             startedAtMs = 0;
+            lastProgressAtMs = 0;
+            progressFingerprint = 0;
+            lastDistance = 0.0f;
             destination = nullptr;
             point = nullptr;
         }
@@ -38,6 +48,7 @@ namespace
     {
         uint32 lastCheckMs = 0;
         LazyQuestIntent intent;
+        std::unordered_map<uint32, uint32> questRetryAfterMs;
     };
 
     std::unordered_map<uint64, LazyBotState> botStates;
@@ -87,6 +98,26 @@ namespace
         return !IsUsableTarget(bot, current);
     }
 
+    uint64 GetQuestProgressFingerprint(Player* bot, uint32 questId)
+    {
+        auto const itr = bot->getQuestStatusMap().find(questId);
+        if (itr == bot->getQuestStatusMap().end())
+            return 0;
+
+        QuestStatusData const& status = itr->second;
+        uint64 fingerprint = status.Status;
+
+        for (uint16 count : status.ItemCount)
+            fingerprint = fingerprint * 131 + count;
+
+        for (uint16 count : status.CreatureOrGOCount)
+            fingerprint = fingerprint * 131 + count;
+
+        fingerprint = fingerprint * 131 + status.PlayerCount;
+        fingerprint = fingerprint * 131 + (status.Explored ? 1 : 0);
+        return fingerprint;
+    }
+
     bool IsIntentValid(Player* bot, LazyQuestIntent const& intent)
     {
         if (!intent.IsActive() || bot->IsQuestRewarded(intent.questId) || !intent.destination->isActive(bot))
@@ -114,6 +145,9 @@ namespace
         state.intent.questId = candidate.questId;
         state.intent.completed = candidate.completed;
         state.intent.startedAtMs = now;
+        state.intent.lastProgressAtMs = now;
+        state.intent.progressFingerprint = GetQuestProgressFingerprint(bot, candidate.questId);
+        state.intent.lastDistance = candidate.distance;
         state.intent.destination = candidate.destination;
         state.intent.point = candidate.point;
 
@@ -133,6 +167,39 @@ namespace
 
         current->setTarget(state.intent.destination, state.intent.point);
         LOG_INFO("playerbots", "[LQ] {} restored quest {} travel target", bot->GetName(), state.intent.questId);
+    }
+
+    void UpdateIntentProgress(Player* bot, LazyQuestIntent& intent, uint32 now)
+    {
+        uint64 fingerprint = GetQuestProgressFingerprint(bot, intent.questId);
+        WorldPosition botPosition(bot);
+        float distance = intent.point->distance(&botPosition);
+
+        if (fingerprint != intent.progressFingerprint || distance + TRAVEL_PROGRESS_YARDS < intent.lastDistance)
+        {
+            intent.progressFingerprint = fingerprint;
+            intent.lastDistance = distance;
+            intent.lastProgressAtMs = now;
+        }
+    }
+
+    std::unordered_set<uint32> GetCoolingDownQuests(LazyBotState& state, uint32 now)
+    {
+        std::unordered_set<uint32> coolingDown;
+
+        for (auto itr = state.questRetryAfterMs.begin(); itr != state.questRetryAfterMs.end();)
+        {
+            if (now >= itr->second)
+            {
+                itr = state.questRetryAfterMs.erase(itr);
+                continue;
+            }
+
+            coolingDown.insert(itr->first);
+            ++itr;
+        }
+
+        return coolingDown;
     }
 }
 
@@ -165,15 +232,34 @@ public:
         {
             if (IsIntentValid(player, state.intent))
             {
-                MaintainIntent(player, state, current);
-                return;
-            }
+                UpdateIntentProgress(player, state.intent, now);
 
-            ReleaseIntent(player, state, "quest state changed");
+                if (getMSTimeDiff(state.intent.lastProgressAtMs, now) < NO_PROGRESS_TIMEOUT_MS)
+                {
+                    MaintainIntent(player, state, current);
+                    return;
+                }
+
+                uint32 stalledQuestId = state.intent.questId;
+                TravelDestination* stalledDestination = state.intent.destination;
+                state.questRetryAfterMs[stalledQuestId] = now + FAILED_QUEST_COOLDOWN_MS;
+
+                if (current && current->getDestination() == stalledDestination)
+                    current->setStatus(TRAVEL_STATUS_EXPIRED);
+
+                LOG_INFO("playerbots", "[LQ] {} cooling down stalled quest {} for 20 minutes", player->GetName(),
+                         stalledQuestId);
+                ReleaseIntent(player, state, "no progress for 5 minutes");
+            }
+            else
+            {
+                ReleaseIntent(player, state, "quest state changed");
+            }
         }
 
+        std::unordered_set<uint32> coolingDown = GetCoolingDownQuests(state, now);
         LazyQuestCandidate candidate;
-        if (!FindLazyQuestCandidate(player, candidate) || !ShouldNudge(player, current))
+        if (!FindLazyQuestCandidate(player, candidate, &coolingDown) || !ShouldNudge(player, current))
             return;
 
         AcquireIntent(player, state, candidate, now);

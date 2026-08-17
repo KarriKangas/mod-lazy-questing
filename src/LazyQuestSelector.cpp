@@ -9,7 +9,8 @@ namespace
     constexpr float MAX_QUEST_DISTANCE = 2500.0f;
 }
 
-bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate)
+bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
+                            std::unordered_set<uint32> const* excludedQuestIds)
 {
     if (!bot)
         return false;
@@ -21,6 +22,9 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate)
     {
         uint32 const questId = quest.first;
         QuestStatusData const& questStatus = quest.second;
+
+        if (excludedQuestIds && excludedQuestIds->count(questId))
+            continue;
 
         if (bot->IsQuestRewarded(questId))
             continue;
