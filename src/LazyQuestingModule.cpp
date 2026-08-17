@@ -49,6 +49,9 @@ namespace
         uint32 lastCheckMs = 0;
         LazyQuestIntent intent;
         std::unordered_map<uint32, uint32> questRetryAfterMs;
+        bool strategyOwnershipActive = false;
+        bool addedTravelStrategy = false;
+        bool removedNewRpgStrategy = false;
     };
 
     std::unordered_map<uint64, LazyBotState> botStates;
@@ -131,16 +134,50 @@ namespace
         return completed == intent.completed;
     }
 
-    void ReleaseIntent(Player* bot, LazyBotState& state, char const* reason)
+    void AcquireStrategyOwnership(PlayerbotAI* botAI, LazyBotState& state)
+    {
+        if (state.strategyOwnershipActive)
+            return;
+
+        state.addedTravelStrategy = !botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT);
+        state.removedNewRpgStrategy = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+
+        if (state.addedTravelStrategy)
+            botAI->ChangeStrategy("+travel", BOT_STATE_NON_COMBAT);
+
+        if (state.removedNewRpgStrategy)
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+
+        state.strategyOwnershipActive = true;
+    }
+
+    void ReleaseStrategyOwnership(PlayerbotAI* botAI, LazyBotState& state)
+    {
+        if (!state.strategyOwnershipActive)
+            return;
+
+        if (state.addedTravelStrategy && botAI->HasStrategy("travel", BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy("-travel", BOT_STATE_NON_COMBAT);
+
+        if (state.removedNewRpgStrategy && !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+
+        state.strategyOwnershipActive = false;
+        state.addedTravelStrategy = false;
+        state.removedNewRpgStrategy = false;
+    }
+
+    void ReleaseIntent(Player* bot, PlayerbotAI* botAI, LazyBotState& state, char const* reason)
     {
         if (!state.intent.IsActive())
             return;
 
         LOG_INFO("playerbots", "[LQ] {} released quest {} intent ({})", bot->GetName(), state.intent.questId, reason);
         state.intent.Clear();
+        ReleaseStrategyOwnership(botAI, state);
     }
 
-    void AcquireIntent(Player* bot, LazyBotState& state, LazyQuestCandidate const& candidate, uint32 now)
+    void AcquireIntent(Player* bot, PlayerbotAI* botAI, LazyBotState& state, LazyQuestCandidate const& candidate, uint32 now)
     {
         state.intent.questId = candidate.questId;
         state.intent.completed = candidate.completed;
@@ -150,6 +187,8 @@ namespace
         state.intent.lastDistance = candidate.distance;
         state.intent.destination = candidate.destination;
         state.intent.point = candidate.point;
+
+        AcquireStrategyOwnership(botAI, state);
 
         Quest const* quest = candidate.destination->GetQuestTemplate();
         LOG_INFO("playerbots", "[LQ] {} acquired quest {} [{}] intent ({}) at {:.0f}y", bot->GetName(),
@@ -249,11 +288,11 @@ public:
 
                 LOG_INFO("playerbots", "[LQ] {} cooling down stalled quest {} for 20 minutes", player->GetName(),
                          stalledQuestId);
-                ReleaseIntent(player, state, "no progress for 5 minutes");
+                ReleaseIntent(player, botAI, state, "no progress for 5 minutes");
             }
             else
             {
-                ReleaseIntent(player, state, "quest state changed");
+                ReleaseIntent(player, botAI, state, "quest state changed");
             }
         }
 
@@ -262,7 +301,7 @@ public:
         if (!FindLazyQuestCandidate(player, candidate, &coolingDown) || !ShouldNudge(player, current))
             return;
 
-        AcquireIntent(player, state, candidate, now);
+        AcquireIntent(player, botAI, state, candidate, now);
         current->setTarget(candidate.destination, candidate.point);
     }
 };
