@@ -14,12 +14,30 @@ namespace
 {
     constexpr uint32 CHECK_INTERVAL_MS = 3 * IN_MILLISECONDS;
 
+    struct LazyQuestIntent
+    {
+        uint32 questId = 0;
+        bool completed = false;
+        uint32 startedAtMs = 0;
+        TravelDestination* destination = nullptr;
+        WorldPosition* point = nullptr;
+
+        bool IsActive() const { return questId != 0 && destination && point; }
+
+        void Clear()
+        {
+            questId = 0;
+            completed = false;
+            startedAtMs = 0;
+            destination = nullptr;
+            point = nullptr;
+        }
+    };
+
     struct LazyBotState
     {
         uint32 lastCheckMs = 0;
-        uint32 lastQuestId = 0;
-        TravelDestination* lastDestination = nullptr;
-        WorldPosition* lastPoint = nullptr;
+        LazyQuestIntent intent;
     };
 
     std::unordered_map<uint64, LazyBotState> botStates;
@@ -69,20 +87,52 @@ namespace
         return !IsUsableTarget(bot, current);
     }
 
-    void LogCandidate(Player* bot, LazyBotState& state, LazyQuestCandidate const& candidate)
+    bool IsIntentValid(Player* bot, LazyQuestIntent const& intent)
     {
-        if (state.lastQuestId == candidate.questId && state.lastDestination == candidate.destination &&
-            state.lastPoint == candidate.point)
+        if (!intent.IsActive() || bot->IsQuestRewarded(intent.questId) || !intent.destination->isActive(bot))
+            return false;
+
+        uint8 status = bot->GetQuestStatus(intent.questId);
+        if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+            return false;
+
+        bool completed = status == QUEST_STATUS_COMPLETE;
+        return completed == intent.completed;
+    }
+
+    void ReleaseIntent(Player* bot, LazyBotState& state, char const* reason)
+    {
+        if (!state.intent.IsActive())
             return;
 
-        state.lastQuestId = candidate.questId;
-        state.lastDestination = candidate.destination;
-        state.lastPoint = candidate.point;
+        LOG_INFO("playerbots", "[LQ] {} released quest {} intent ({})", bot->GetName(), state.intent.questId, reason);
+        state.intent.Clear();
+    }
+
+    void AcquireIntent(Player* bot, LazyBotState& state, LazyQuestCandidate const& candidate, uint32 now)
+    {
+        state.intent.questId = candidate.questId;
+        state.intent.completed = candidate.completed;
+        state.intent.startedAtMs = now;
+        state.intent.destination = candidate.destination;
+        state.intent.point = candidate.point;
 
         Quest const* quest = candidate.destination->GetQuestTemplate();
-        LOG_INFO("playerbots", "[LQ] {} would prefer quest {} [{}] -> {} at {:.0f}y", bot->GetName(),
-                 candidate.questId, quest ? quest->GetTitle() : "<unknown>", candidate.destination->getTitle(),
-                 candidate.distance);
+        LOG_INFO("playerbots", "[LQ] {} acquired quest {} [{}] intent ({}) at {:.0f}y", bot->GetName(),
+                 candidate.questId, quest ? quest->GetTitle() : "<unknown>",
+                 candidate.completed ? "turn-in" : "objective", candidate.distance);
+    }
+
+    void MaintainIntent(Player* bot, LazyBotState& state, TravelTarget* current)
+    {
+        if (!current || current->isForced() || current->isGroupCopy())
+            return;
+
+        if (current->getDestination() == state.intent.destination && IsUsableTarget(bot, current))
+            return;
+
+        current->setTarget(state.intent.destination, state.intent.point);
+        LOG_INFO("playerbots", "[LQ] {} restored quest {} travel target", bot->GetName(), state.intent.questId);
     }
 }
 
@@ -100,45 +150,34 @@ public:
             player->IsBeingTeleported())
             return;
 
-        if (!GET_PLAYERBOT_AI(player))
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+        if (!botAI)
             return;
 
         LazyBotState& state = botStates[player->GetGUID().GetRawValue()];
-        if (!ShouldCheck(state, getMSTime()))
+        uint32 now = getMSTime();
+        if (!ShouldCheck(state, now))
             return;
 
-        LazyQuestCandidate candidate;
-        if (!FindLazyQuestCandidate(player, candidate))
-        {
-            state.lastQuestId = 0;
-            state.lastDestination = nullptr;
-            state.lastPoint = nullptr;
-            return;
-        }
-
-        PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
         TravelTarget* current = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
 
-        if (!ShouldNudge(player, current))
+        if (state.intent.IsActive())
         {
-            LogCandidate(player, state, candidate);
-            return;
+            if (IsIntentValid(player, state.intent))
+            {
+                MaintainIntent(player, state, current);
+                return;
+            }
+
+            ReleaseIntent(player, state, "quest state changed");
         }
 
-        std::string oldTarget = "none";
-        if (current && current->getDestination())
-            oldTarget = current->getDestination()->getName();
+        LazyQuestCandidate candidate;
+        if (!FindLazyQuestCandidate(player, candidate) || !ShouldNudge(player, current))
+            return;
 
+        AcquireIntent(player, state, candidate, now);
         current->setTarget(candidate.destination, candidate.point);
-
-        state.lastQuestId = candidate.questId;
-        state.lastDestination = candidate.destination;
-        state.lastPoint = candidate.point;
-
-        Quest const* quest = candidate.destination->GetQuestTemplate();
-        LOG_INFO("playerbots", "[LQ] {}: {} -> quest {} [{}] ({}) at {:.0f}y", player->GetName(), oldTarget,
-                 candidate.questId, quest ? quest->GetTitle() : "<unknown>", candidate.destination->getTitle(),
-                 candidate.distance);
     }
 };
 
