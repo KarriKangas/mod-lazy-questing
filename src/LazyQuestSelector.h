@@ -3,19 +3,28 @@
 
 #include "Define.h"
 
+#include <unordered_set>
+
 class Player;
 class TravelDestination;
 class WorldPosition;
+
+enum class LazyQuestIntentType : uint8
+{
+    DoQuest,
+    TurnIn,
+};
 
 struct LazyQuestCandidate
 {
     TravelDestination* destination = nullptr;
     WorldPosition* point = nullptr;
     uint32 questId = 0;
-    bool completed = false;
+    LazyQuestIntentType type = LazyQuestIntentType::DoQuest;
     float distance = 0.0f;
 };
 
-bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate);
+bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
+                            std::unordered_set<uint32> const* excludedQuestIds = nullptr);
 
 #endif
