@@ -580,47 +580,27 @@ namespace
                intent.noQuestProgressMs >= HARD_QUEST_TIMEOUT_MS;
     }
 
-    ObjectGuid FindNearbyQuestGiver(Player* bot, PlayerbotAI* botAI,
-                                    QuestRelationTravelDestination* destination)
+    ObjectGuid FindNearbyQuestGiver(Player* bot, QuestRelationTravelDestination* destination)
     {
         if (!destination)
             return ObjectGuid::Empty;
 
         int32 const entry = destination->getEntry();
-        WorldObject* nearest = nullptr;
-
         if (entry > 0)
         {
-            GuidVector const npcs = botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest npcs")->Get();
-            for (ObjectGuid const& guid : npcs)
-            {
-                Creature* creature = botAI->GetCreature(guid);
-                if (!creature || creature->GetEntry() != static_cast<uint32>(entry) ||
-                    !bot->CanInteractWithQuestGiver(creature))
-                    continue;
-
-                if (!nearest || bot->GetDistance(creature) < bot->GetDistance(nearest))
-                    nearest = creature;
-            }
+            Creature* creature = bot->FindNearestCreature(static_cast<uint32>(entry), INTERACTION_DISTANCE);
+            return creature && bot->CanInteractWithQuestGiver(creature) ? creature->GetGUID() : ObjectGuid::Empty;
         }
-        else if (entry < 0)
+
+        if (entry < 0)
         {
-            GuidVector const gameObjects =
-                botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest game objects")->Get();
             uint32 const gameObjectEntry = static_cast<uint32>(-entry);
-            for (ObjectGuid const& guid : gameObjects)
-            {
-                GameObject* gameObject = botAI->GetGameObject(guid);
-                if (!gameObject || gameObject->GetEntry() != gameObjectEntry ||
-                    !bot->CanInteractWithQuestGiver(gameObject))
-                    continue;
-
-                if (!nearest || bot->GetDistance(gameObject) < bot->GetDistance(nearest))
-                    nearest = gameObject;
-            }
+            GameObject* gameObject = bot->FindNearestGameObject(gameObjectEntry, INTERACTION_DISTANCE, true);
+            return gameObject && bot->CanInteractWithQuestGiver(gameObject) ? gameObject->GetGUID()
+                                                                            : ObjectGuid::Empty;
         }
 
-        return nearest ? nearest->GetGUID() : ObjectGuid::Empty;
+        return ObjectGuid::Empty;
     }
 
     uint32 GetInteractionRetryMs(LazyQuestIntent const& intent)
@@ -639,7 +619,7 @@ namespace
             return false;
 
         auto* relation = dynamic_cast<QuestRelationTravelDestination*>(intent.destination);
-        ObjectGuid const questGiver = FindNearbyQuestGiver(bot, botAI, relation);
+        ObjectGuid const questGiver = FindNearbyQuestGiver(bot, relation);
         if (!questGiver)
             return false;
 
@@ -660,10 +640,7 @@ namespace
         }
         else
         {
-            WorldPacket packet(CMSG_QUESTGIVER_COMPLETE_QUEST);
-            packet << questGiver;
-            packet.rpos(0);
-            completed = botAI->DoSpecificAction("talk to quest giver", Event("lazy questing", packet), true);
+            completed = botAI->DoSpecificAction("talk to quest giver", Event("lazy questing", questGiver), true);
         }
 
         if (completed)
@@ -1220,6 +1197,16 @@ namespace
             bool currentActive = false;
             if (current && IsTravelTargetForIntent(current, state.intent))
             {
+                // Relation destinations in Playerbots still depend on the retired "rpg quest" strategy.
+                // Interact before isActive() can put a successfully reached relation target into cooldown.
+                if (TryQuestInteraction(player, botAI, state.intent, current, nowMs))
+                {
+                    ++_metrics.semanticProgress;
+                    Schedule(guid, state, ScheduleLane::Active,
+                             now + std::chrono::milliseconds(POST_INTERACTION_RETRY_MS));
+                    return;
+                }
+
                 if (current->getStatus() == TRAVEL_STATUS_PREPARE)
                 {
                     PauseIntentTracking(player, state.intent, nowMs);
@@ -1273,10 +1260,8 @@ namespace
                 return;
             }
 
-            bool const interacted = TryQuestInteraction(player, botAI, state.intent, current, nowMs);
             Schedule(guid, state, ScheduleLane::Active,
-                     now + std::chrono::milliseconds(interacted ? POST_INTERACTION_RETRY_MS
-                                                                : _config.activeCheckIntervalMs));
+                     now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
         }
 
         uint32 GetDiscoveryDelayMs(uint64 guid, LazyBotState& state) const
