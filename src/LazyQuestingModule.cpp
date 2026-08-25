@@ -1,3 +1,4 @@
+#include "Event.h"
 #include "Log.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
@@ -16,6 +17,7 @@ namespace
     constexpr uint32 CHECK_INTERVAL_MS = 3 * IN_MILLISECONDS;
     constexpr uint32 NO_PROGRESS_TIMEOUT_MS = 5 * MINUTE * IN_MILLISECONDS;
     constexpr uint32 FAILED_QUEST_COOLDOWN_MS = 20 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 QUEST_INTERACTION_RETRY_MS = 5 * IN_MILLISECONDS;
     constexpr float TRAVEL_PROGRESS_YARDS = 50.0f;
 
     char const* IntentTypeName(LazyQuestIntentType type)
@@ -38,6 +40,7 @@ namespace
         LazyQuestIntentType type = LazyQuestIntentType::DoQuest;
         uint32 startedAtMs = 0;
         uint32 lastProgressAtMs = 0;
+        uint32 lastInteractionAtMs = 0;
         uint64 progressFingerprint = 0;
         float lastDistance = 0.0f;
         TravelDestination* destination = nullptr;
@@ -51,6 +54,7 @@ namespace
             type = LazyQuestIntentType::DoQuest;
             startedAtMs = 0;
             lastProgressAtMs = 0;
+            lastInteractionAtMs = 0;
             progressFingerprint = 0;
             lastDistance = 0.0f;
             destination = nullptr;
@@ -159,7 +163,7 @@ namespace
 
     bool IsIntentValid(Player* bot, LazyQuestIntent const& intent)
     {
-        if (!intent.IsActive() || bot->IsQuestRewarded(intent.questId) || !intent.destination->isActive(bot))
+        if (!intent.IsActive() || bot->IsQuestRewarded(intent.questId))
             return false;
 
         uint8 status = bot->GetQuestStatus(intent.questId);
@@ -173,7 +177,8 @@ namespace
             currentType = LazyQuestIntentType::TurnIn;
         else
             currentType = LazyQuestIntentType::DoQuest;
-        return currentType == intent.type;
+        return currentType == intent.type &&
+               IsLazyQuestDestinationActive(bot, intent.destination, intent.type);
     }
 
     void AcquireStrategyOwnership(Player* bot, PlayerbotAI* botAI, LazyBotState& state)
@@ -234,6 +239,13 @@ namespace
         if (!state.intent.IsActive())
             return;
 
+        TravelTarget* current = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+        if (current && current->getDestination() == state.intent.destination)
+        {
+            current->setForced(false);
+            current->setStatus(TRAVEL_STATUS_EXPIRED);
+        }
+
         LOG_INFO("playerbots", "[LQ] {} released {} quest {} intent ({})", bot->GetName(),
                  IntentTypeName(state.intent.type), state.intent.questId, reason);
         state.intent.Clear();
@@ -246,6 +258,7 @@ namespace
         state.intent.type = candidate.type;
         state.intent.startedAtMs = now;
         state.intent.lastProgressAtMs = now;
+        state.intent.lastInteractionAtMs = 0;
         state.intent.progressFingerprint = GetQuestProgressFingerprint(bot, candidate.questId);
         state.intent.lastDistance = candidate.distance;
         state.intent.destination = candidate.destination;
@@ -261,15 +274,111 @@ namespace
 
     void MaintainIntent(Player* bot, LazyBotState& state, TravelTarget* current)
     {
-        if (!current || current->isForced() || current->isGroupCopy())
+        if (!current || current->isGroupCopy())
             return;
 
-        if (current->getDestination() == state.intent.destination && IsUsableTarget(bot, current))
+        if (current->getDestination() == state.intent.destination)
+        {
+            bool const relationIntent = state.intent.type != LazyQuestIntentType::DoQuest;
+            if (relationIntent)
+                current->setForced(true);
+
+            if (current->getStatus() != TRAVEL_STATUS_EXPIRED && current->isActive() &&
+                IsLazyQuestDestinationActive(bot, state.intent.destination, state.intent.type))
+                return;
+        }
+
+        if (current->isForced())
             return;
 
         current->setTarget(state.intent.destination, state.intent.point);
+        current->setForced(state.intent.type != LazyQuestIntentType::DoQuest);
         LOG_INFO("playerbots", "[LQ] {} restored {} quest {} travel target", bot->GetName(),
                  IntentTypeName(state.intent.type), state.intent.questId);
+    }
+
+    ObjectGuid FindNearbyQuestGiver(Player* bot, PlayerbotAI* botAI, QuestRelationTravelDestination* destination)
+    {
+        if (!destination)
+            return ObjectGuid::Empty;
+
+        int32 const entry = destination->getEntry();
+        WorldObject* nearest = nullptr;
+
+        if (entry > 0)
+        {
+            GuidVector const npcs = botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest npcs")->Get();
+            for (ObjectGuid const& guid : npcs)
+            {
+                Creature* creature = botAI->GetCreature(guid);
+                if (!creature || creature->GetEntry() != static_cast<uint32>(entry) ||
+                    !bot->CanInteractWithQuestGiver(creature))
+                    continue;
+
+                if (!nearest || bot->GetDistance(creature) < bot->GetDistance(nearest))
+                    nearest = creature;
+            }
+        }
+        else if (entry < 0)
+        {
+            GuidVector const gameObjects =
+                botAI->GetAiObjectContext()->GetValue<GuidVector>("nearest game objects")->Get();
+            uint32 const gameObjectEntry = static_cast<uint32>(-entry);
+            for (ObjectGuid const& guid : gameObjects)
+            {
+                GameObject* gameObject = botAI->GetGameObject(guid);
+                if (!gameObject || gameObject->GetEntry() != gameObjectEntry ||
+                    !bot->CanInteractWithQuestGiver(gameObject))
+                    continue;
+
+                if (!nearest || bot->GetDistance(gameObject) < bot->GetDistance(nearest))
+                    nearest = gameObject;
+            }
+        }
+
+        return nearest ? nearest->GetGUID() : ObjectGuid::Empty;
+    }
+
+    bool TryQuestInteraction(Player* bot, PlayerbotAI* botAI, LazyQuestIntent& intent, TravelTarget* current,
+                             uint32 now)
+    {
+        if (intent.type == LazyQuestIntentType::DoQuest || !current ||
+            current->getDestination() != intent.destination ||
+            (intent.lastInteractionAtMs != 0 &&
+             getMSTimeDiff(intent.lastInteractionAtMs, now) < QUEST_INTERACTION_RETRY_MS))
+            return false;
+
+        auto* relation = dynamic_cast<QuestRelationTravelDestination*>(intent.destination);
+        ObjectGuid const questGiver = FindNearbyQuestGiver(bot, botAI, relation);
+        if (!questGiver)
+            return false;
+
+        intent.lastInteractionAtMs = now;
+
+        if (intent.type == LazyQuestIntentType::PickUp)
+        {
+            Quest const* quest = intent.destination->GetQuestTemplate();
+            if (!quest || !IsLazyQuestDestinationActive(bot, intent.destination, intent.type))
+                return false;
+
+            WorldPacket packet(CMSG_QUESTGIVER_ACCEPT_QUEST);
+            packet << questGiver << intent.questId << uint32(0);
+            packet.rpos(0);
+            bot->GetSession()->HandleQuestgiverAcceptQuestOpcode(packet);
+
+            bool const accepted = bot->GetQuestStatus(intent.questId) != QUEST_STATUS_NONE;
+            LOG_INFO("playerbots", "[LQ] {} {} pick-up quest {} interaction", bot->GetName(),
+                     accepted ? "completed" : "attempted", intent.questId);
+            return accepted;
+        }
+
+        WorldPacket packet(CMSG_QUESTGIVER_COMPLETE_QUEST);
+        packet << questGiver;
+        packet.rpos(0);
+        bool const turnedIn = botAI->DoSpecificAction("talk to quest giver", Event("lazy questing", packet), true);
+        LOG_INFO("playerbots", "[LQ] {} {} turn-in quest {} interaction", bot->GetName(),
+                 turnedIn ? "completed" : "attempted", intent.questId);
+        return turnedIn;
     }
 
     void UpdateIntentProgress(Player* bot, LazyQuestIntent& intent, uint32 now)
@@ -340,6 +449,7 @@ public:
                 if (getMSTimeDiff(state.intent.lastProgressAtMs, now) < NO_PROGRESS_TIMEOUT_MS)
                 {
                     MaintainIntent(player, state, current);
+                    TryQuestInteraction(player, botAI, state.intent, current, now);
                     return;
                 }
 
@@ -360,13 +470,17 @@ public:
             }
         }
 
+        if (!ShouldNudge(player, botAI, current))
+            return;
+
         std::unordered_set<uint32> coolingDown = GetCoolingDownQuests(state, now);
         LazyQuestCandidate candidate;
-        if (!FindLazyQuestCandidate(player, candidate, &coolingDown) || !ShouldNudge(player, botAI, current))
+        if (!FindLazyQuestCandidate(player, candidate, &coolingDown))
             return;
 
         AcquireIntent(player, botAI, state, candidate, now);
         current->setTarget(candidate.destination, candidate.point);
+        current->setForced(candidate.type != LazyQuestIntentType::DoQuest);
     }
 };
 
