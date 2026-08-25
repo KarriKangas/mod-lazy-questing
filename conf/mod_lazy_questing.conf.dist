@@ -12,7 +12,7 @@ LazyQuesting.ActiveCheckIntervalMs = 5000
 LazyQuesting.DiscoveryIntervalMs = 30000
 LazyQuesting.MaxDiscoveryBackoffMs = 120000
 
-# Hard scheduler limits. The time budget is shared by active maintenance and discovery each world tick.
+# Hard scheduler limits. Registration, active maintenance, and discovery share this per-world-tick budget.
 LazyQuesting.WorldBudgetMs = 2
 LazyQuesting.MaxActiveBotsPerTick = 64
 LazyQuesting.MaxDiscoveryBotsPerTick = 4

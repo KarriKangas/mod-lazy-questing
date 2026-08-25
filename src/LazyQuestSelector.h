@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <unordered_set>
+#include <vector>
 
 class Player;
 class TravelDestination;
@@ -46,6 +47,10 @@ LazyQuestIndexStats GetLazyQuestIndexStats();
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds = nullptr,
                             LazyQuestSelectionStats* stats = nullptr);
+bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
+                      TravelDestination* preferredDestination,
+                      std::vector<WorldPosition*> const& excludedPoints,
+                      LazyQuestCandidate& candidate);
 bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, LazyQuestIntentType type);
 
 #endif

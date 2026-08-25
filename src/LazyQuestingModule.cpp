@@ -13,10 +13,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <mutex>
 #include <queue>
-#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,16 +28,28 @@ namespace
     using SchedulerClock = std::chrono::steady_clock;
     using SchedulerTime = SchedulerClock::time_point;
 
-    constexpr uint32 NO_PROGRESS_TIMEOUT_MS = 5 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 NO_MOVEMENT_TIMEOUT_MS = MINUTE * IN_MILLISECONDS;
+    constexpr uint32 NO_APPROACH_TIMEOUT_MS = 3 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 NO_WORK_PROGRESS_TIMEOUT_MS = 2 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 HARD_QUEST_TIMEOUT_MS = 10 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 EXHAUSTED_QUEST_COOLDOWN_MS = 5 * MINUTE * IN_MILLISECONDS;
     constexpr uint32 FAILED_QUEST_COOLDOWN_MS = 20 * MINUTE * IN_MILLISECONDS;
     constexpr uint32 QUEST_INTERACTION_RETRY_MIN_MS = 5 * IN_MILLISECONDS;
     constexpr uint32 QUEST_INTERACTION_RETRY_MAX_MS = MINUTE * IN_MILLISECONDS;
     constexpr uint32 TRANSIENT_RETRY_MS = 5 * IN_MILLISECONDS;
     constexpr uint32 POST_INTERACTION_RETRY_MS = IN_MILLISECONDS;
+    constexpr uint32 REGISTRATION_RETRY_MIN_MS = 250;
+    constexpr uint32 REGISTRATION_RETRY_MAX_MS = 5 * IN_MILLISECONDS;
+    constexpr uint32 REGISTRATION_RETRY_TIMEOUT_MS = MINUTE * IN_MILLISECONDS;
+    constexpr uint32 ROSTER_RECONCILE_INTERVAL_MS = 30 * IN_MILLISECONDS;
     constexpr std::size_t MAX_PENDING_EVENTS_PER_TICK = 512;
-    constexpr uint8 MAX_REGISTRATION_RETRIES = 20;
+    constexpr uint32 MAX_REGISTRATIONS_PER_TICK = 16;
+    constexpr uint32 MAX_ROSTER_RECONCILE_PER_TICK = 32;
     constexpr std::size_t MAX_QUEST_COOLDOWNS_PER_BOT = 32;
-    constexpr float TRAVEL_PROGRESS_YARDS = 50.0f;
+    constexpr std::size_t MAX_FAILED_POINTS_PER_INTENT = 6;
+    constexpr uint8 MAX_FAILED_LEGS_PER_INTENT = 3;
+    constexpr float MOVEMENT_PROGRESS_YARDS = 5.0f;
+    constexpr float APPROACH_PROGRESS_YARDS = 10.0f;
 
     struct LazyQuestingConfig
     {
@@ -102,13 +114,24 @@ namespace
         uint32 questId = 0;
         LazyQuestIntentType type = LazyQuestIntentType::DoQuest;
         uint32 startedAtMs = 0;
-        uint32 lastProgressAtMs = 0;
+        uint32 lastSampleAtMs = 0;
         uint32 lastInteractionAtMs = 0;
+        uint32 noMovementMs = 0;
+        uint32 noApproachMs = 0;
+        uint32 noWorkProgressMs = 0;
+        uint32 noQuestProgressMs = 0;
         uint8 interactionFailures = 0;
+        uint8 legFailures = 0;
         uint64 progressFingerprint = 0;
-        float lastDistance = 0.0f;
+        uint32 lastMapId = 0;
+        float lastX = 0.0f;
+        float lastY = 0.0f;
+        float lastZ = 0.0f;
+        float bestDistance = 0.0f;
         TravelDestination* destination = nullptr;
         WorldPosition* point = nullptr;
+        std::vector<WorldPosition*> failedPoints;
+        bool suspended = false;
 
         bool IsActive() const { return questId != 0 && destination && point; }
 
@@ -117,13 +140,24 @@ namespace
             questId = 0;
             type = LazyQuestIntentType::DoQuest;
             startedAtMs = 0;
-            lastProgressAtMs = 0;
+            lastSampleAtMs = 0;
             lastInteractionAtMs = 0;
+            noMovementMs = 0;
+            noApproachMs = 0;
+            noWorkProgressMs = 0;
+            noQuestProgressMs = 0;
             interactionFailures = 0;
+            legFailures = 0;
             progressFingerprint = 0;
-            lastDistance = 0.0f;
+            lastMapId = 0;
+            lastX = 0.0f;
+            lastY = 0.0f;
+            lastZ = 0.0f;
+            bestDistance = 0.0f;
             destination = nullptr;
             point = nullptr;
+            failedPoints.clear();
+            suspended = false;
         }
     };
 
@@ -189,7 +223,7 @@ namespace
 
     bool ShouldNudge(Player* bot, PlayerbotAI* botAI, TravelTarget* current)
     {
-        if (!current || current->isGroupCopy())
+        if (!current || current->isGroupCopy() || HasEssentialRpgNeed(botAI))
             return false;
 
         TravelDestination* destination = current->getDestination();
@@ -231,7 +265,7 @@ namespace
         return fingerprint;
     }
 
-    bool IsIntentValid(Player* bot, LazyQuestIntent const& intent)
+    bool IsIntentQuestStateValid(Player* bot, LazyQuestIntent const& intent)
     {
         if (!intent.IsActive() || bot->IsQuestRewarded(intent.questId))
             return false;
@@ -248,8 +282,7 @@ namespace
         else
             currentType = LazyQuestIntentType::DoQuest;
 
-        return currentType == intent.type &&
-               IsLazyQuestDestinationActive(bot, intent.destination, intent.type);
+        return currentType == intent.type;
     }
 
     void AcquireStrategyOwnership(Player* bot, PlayerbotAI* botAI, LazyBotState& state)
@@ -321,13 +354,25 @@ namespace
         state.intent.questId = candidate.questId;
         state.intent.type = candidate.type;
         state.intent.startedAtMs = nowMs;
-        state.intent.lastProgressAtMs = nowMs;
+        state.intent.lastSampleAtMs = nowMs;
         state.intent.lastInteractionAtMs = 0;
+        state.intent.noMovementMs = 0;
+        state.intent.noApproachMs = 0;
+        state.intent.noWorkProgressMs = 0;
+        state.intent.noQuestProgressMs = 0;
         state.intent.interactionFailures = 0;
+        state.intent.legFailures = 0;
         state.intent.progressFingerprint = GetQuestProgressFingerprint(bot, candidate.questId);
-        state.intent.lastDistance = candidate.distance;
+        state.intent.lastMapId = bot->GetMapId();
+        state.intent.lastX = bot->GetPositionX();
+        state.intent.lastY = bot->GetPositionY();
+        state.intent.lastZ = bot->GetPositionZ();
+        state.intent.bestDistance = candidate.distance;
         state.intent.destination = candidate.destination;
         state.intent.point = candidate.point;
+        state.intent.failedPoints.clear();
+        state.intent.failedPoints.reserve(MAX_FAILED_POINTS_PER_INTENT);
+        state.intent.suspended = false;
         state.consecutiveDiscoveryMisses = 0;
 
         AcquireStrategyOwnership(bot, botAI, state);
@@ -338,28 +383,201 @@ namespace
                   candidate.distance);
     }
 
-    void MaintainIntent(Player* bot, LazyBotState& state, TravelTarget* current)
+    bool IsTravelTargetForIntent(TravelTarget* current, LazyQuestIntent const& intent)
     {
-        if (!current || current->isGroupCopy())
-            return;
+        if (!current || !current->getDestination())
+            return false;
 
-        if (current->getDestination() == state.intent.destination)
+        TravelDestination* destination = current->getDestination();
+        Quest const* quest = destination->GetQuestTemplate();
+        if (!quest || quest->GetQuestId() != intent.questId)
+            return false;
+
+        if (intent.type == LazyQuestIntentType::DoQuest)
+            return dynamic_cast<QuestObjectiveTravelDestination*>(destination) != nullptr;
+
+        auto* relation = dynamic_cast<QuestRelationTravelDestination*>(destination);
+        if (!relation)
+            return false;
+
+        return intent.type == LazyQuestIntentType::PickUp ? relation->getRelation() == 0
+                                                         : relation->getRelation() != 0;
+    }
+
+    void ResetIntentLegTracking(Player* bot, LazyQuestIntent& intent, uint32 nowMs)
+    {
+        intent.lastSampleAtMs = nowMs;
+        intent.noMovementMs = 0;
+        intent.noApproachMs = 0;
+        intent.noWorkProgressMs = 0;
+        intent.lastMapId = bot->GetMapId();
+        intent.lastX = bot->GetPositionX();
+        intent.lastY = bot->GetPositionY();
+        intent.lastZ = bot->GetPositionZ();
+        WorldPosition botPosition(bot);
+        intent.bestDistance = intent.point ? intent.point->distance(&botPosition) : 0.0f;
+        intent.suspended = false;
+    }
+
+    void AssignIntentLeg(Player* bot, LazyQuestIntent& intent, TravelTarget* current,
+                         LazyQuestCandidate const& candidate, uint32 nowMs)
+    {
+        intent.destination = candidate.destination;
+        intent.point = candidate.point;
+        intent.lastInteractionAtMs = 0;
+        intent.interactionFailures = 0;
+        ResetIntentLegTracking(bot, intent, nowMs);
+
+        current->setTarget(candidate.destination, candidate.point);
+        // Forced travel prevents an empty spawn from invalidating the destination before the bot reaches
+        // the selected alternate point. Objective work becomes non-forced again on arrival.
+        current->setForced(true);
+    }
+
+    void AdoptIntentLeg(Player* bot, LazyQuestIntent& intent, TravelTarget* current, uint32 nowMs)
+    {
+        intent.destination = current->getDestination();
+        intent.point = current->getPosition();
+        intent.lastInteractionAtMs = 0;
+        intent.interactionFailures = 0;
+        ResetIntentLegTracking(bot, intent, nowMs);
+    }
+
+    bool ObserveQuestProgress(Player* bot, LazyQuestIntent& intent)
+    {
+        uint64 const fingerprint = GetQuestProgressFingerprint(bot, intent.questId);
+        if (fingerprint == intent.progressFingerprint)
+            return false;
+
+        intent.progressFingerprint = fingerprint;
+        intent.noQuestProgressMs = 0;
+        intent.noWorkProgressMs = 0;
+        intent.legFailures = 0;
+        intent.failedPoints.clear();
+        return true;
+    }
+
+    void PauseIntentTracking(Player* bot, LazyQuestIntent& intent, uint32 nowMs)
+    {
+        intent.lastSampleAtMs = nowMs;
+        if (bot->IsInWorld())
         {
-            bool const relationIntent = state.intent.type != LazyQuestIntentType::DoQuest;
-            if (relationIntent)
-                current->setForced(true);
+            intent.lastMapId = bot->GetMapId();
+            intent.lastX = bot->GetPositionX();
+            intent.lastY = bot->GetPositionY();
+            intent.lastZ = bot->GetPositionZ();
+        }
+        intent.suspended = true;
+    }
 
-            if (current->getStatus() != TRAVEL_STATUS_EXPIRED && current->isActive())
-                return;
+    void UpdateIntentProgress(Player* bot, LazyQuestIntent& intent, TravelTarget* current,
+                              uint32 nowMs, bool semanticProgress)
+    {
+        uint32 const elapsedMs = intent.suspended ? 0 : getMSTimeDiff(intent.lastSampleAtMs, nowMs);
+        intent.suspended = false;
+        intent.lastSampleAtMs = nowMs;
+
+        uint32 const currentMapId = bot->GetMapId();
+        float const x = bot->GetPositionX();
+        float const y = bot->GetPositionY();
+        float const z = bot->GetPositionZ();
+
+        if (currentMapId != intent.lastMapId)
+        {
+            intent.noMovementMs = 0;
+            intent.noApproachMs = 0;
+            intent.bestDistance = 0.0f;
+        }
+        else
+        {
+            float const dx = x - intent.lastX;
+            float const dy = y - intent.lastY;
+            float const dz = z - intent.lastZ;
+            float const movement = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (movement >= MOVEMENT_PROGRESS_YARDS)
+                intent.noMovementMs = 0;
+            else
+                intent.noMovementMs += elapsedMs;
         }
 
-        if (current->isForced())
+        WorldPosition botPosition(bot);
+        float const distance = intent.point ? intent.point->distance(&botPosition) : 0.0f;
+        if (intent.bestDistance == 0.0f || distance + APPROACH_PROGRESS_YARDS < intent.bestDistance)
+        {
+            intent.bestDistance = distance;
+            intent.noApproachMs = 0;
+        }
+        else
+            intent.noApproachMs += elapsedMs;
+
+        if (!semanticProgress)
+            intent.noQuestProgressMs += elapsedMs;
+
+        if (current && current->getStatus() == TRAVEL_STATUS_WORK && !semanticProgress)
+            intent.noWorkProgressMs += elapsedMs;
+        else if (!current || current->getStatus() != TRAVEL_STATUS_WORK)
+            intent.noWorkProgressMs = 0;
+
+        intent.lastMapId = currentMapId;
+        intent.lastX = x;
+        intent.lastY = y;
+        intent.lastZ = z;
+    }
+
+    enum class IntentRecoveryResult : uint8
+    {
+        Repointed,
+        Exhausted,
+        HardFailed,
+    };
+
+    void RememberFailedPoint(LazyQuestIntent& intent)
+    {
+        if (!intent.point || std::find(intent.failedPoints.begin(), intent.failedPoints.end(), intent.point) !=
+            intent.failedPoints.end())
             return;
 
-        current->setTarget(state.intent.destination, state.intent.point);
-        current->setForced(state.intent.type != LazyQuestIntentType::DoQuest);
-        LOG_DEBUG("playerbots", "[LQ] {} restored {} quest {} travel target", bot->GetName(),
-                  IntentTypeName(state.intent.type), state.intent.questId);
+        if (intent.failedPoints.size() >= MAX_FAILED_POINTS_PER_INTENT)
+            intent.failedPoints.erase(intent.failedPoints.begin());
+        intent.failedPoints.push_back(intent.point);
+    }
+
+    IntentRecoveryResult RecoverIntentLeg(Player* bot, LazyQuestIntent& intent, TravelTarget* current,
+                                           uint32 nowMs)
+    {
+        if (!current)
+            return IntentRecoveryResult::Exhausted;
+
+        RememberFailedPoint(intent);
+        if (intent.legFailures < 255)
+            ++intent.legFailures;
+
+        if (intent.legFailures >= MAX_FAILED_LEGS_PER_INTENT ||
+            intent.noQuestProgressMs >= HARD_QUEST_TIMEOUT_MS)
+            return IntentRecoveryResult::HardFailed;
+
+        LazyQuestCandidate candidate;
+        if (!FindLazyQuestLeg(bot, intent.questId, intent.type, intent.destination,
+                              intent.failedPoints, candidate))
+            return IntentRecoveryResult::Exhausted;
+
+        AssignIntentLeg(bot, intent, current, candidate, nowMs);
+        return IntentRecoveryResult::Repointed;
+    }
+
+    bool IntentNeedsRecovery(LazyQuestIntent const& intent, TravelTarget* current)
+    {
+        if (!current || !IsTravelTargetForIntent(current, intent))
+            return true;
+
+        TravelStatus const status = current->getStatus();
+        return status == TRAVEL_STATUS_NONE || status == TRAVEL_STATUS_COOLDOWN ||
+               status == TRAVEL_STATUS_EXPIRED ||
+               (status == TRAVEL_STATUS_TRAVEL &&
+                (intent.noMovementMs >= NO_MOVEMENT_TIMEOUT_MS ||
+                 intent.noApproachMs >= NO_APPROACH_TIMEOUT_MS)) ||
+               (status == TRAVEL_STATUS_WORK && intent.noWorkProgressMs >= NO_WORK_PROGRESS_TIMEOUT_MS) ||
+               intent.noQuestProgressMs >= HARD_QUEST_TIMEOUT_MS;
     }
 
     ObjectGuid FindNearbyQuestGiver(Player* bot, PlayerbotAI* botAI,
@@ -458,21 +676,7 @@ namespace
         return completed;
     }
 
-    void UpdateIntentProgress(Player* bot, LazyQuestIntent& intent, uint32 nowMs)
-    {
-        uint64 const fingerprint = GetQuestProgressFingerprint(bot, intent.questId);
-        WorldPosition botPosition(bot);
-        float const distance = intent.point->distance(&botPosition);
-
-        if (fingerprint != intent.progressFingerprint || distance + TRAVEL_PROGRESS_YARDS < intent.lastDistance)
-        {
-            intent.progressFingerprint = fingerprint;
-            intent.lastDistance = distance;
-            intent.lastProgressAtMs = nowMs;
-        }
-    }
-
-    void AddQuestCooldown(LazyBotState& state, uint32 questId, SchedulerTime now)
+    void AddQuestCooldown(LazyBotState& state, uint32 questId, SchedulerTime now, uint32 cooldownMs)
     {
         if (!state.questRetryAfter.count(questId) && state.questRetryAfter.size() >= MAX_QUEST_COOLDOWNS_PER_BOT)
         {
@@ -483,7 +687,7 @@ namespace
                 state.questRetryAfter.erase(earliest);
         }
 
-        state.questRetryAfter[questId] = now + std::chrono::milliseconds(FAILED_QUEST_COOLDOWN_MS);
+        state.questRetryAfter[questId] = now + std::chrono::milliseconds(cooldownMs);
     }
 
     std::unordered_set<uint32> GetCoolingDownQuests(LazyBotState& state, SchedulerTime now)
@@ -532,7 +736,28 @@ namespace
     {
         PendingBotEventType type;
         uint64 guid;
+    };
+
+    struct RegistrationRetryState
+    {
+        SchedulerTime startedAt;
+        uint64 generation = 0;
         uint8 attempts = 0;
+    };
+
+    struct ScheduledRegistration
+    {
+        SchedulerTime due;
+        uint64 guid = 0;
+        uint64 generation = 0;
+    };
+
+    struct ScheduledRegistrationLater
+    {
+        bool operator()(ScheduledRegistration const& left, ScheduledRegistration const& right) const
+        {
+            return left.due > right.due;
+        }
     };
 
     struct SchedulerMetrics
@@ -546,6 +771,14 @@ namespace
         uint64 pickupDestinationsEvaluated = 0;
         uint64 candidatesFound = 0;
         uint64 budgetLimitedTicks = 0;
+        uint64 registrationsCompleted = 0;
+        uint64 registrationRetries = 0;
+        uint64 registrationTimeouts = 0;
+        uint64 semanticProgress = 0;
+        uint64 repoints = 0;
+        uint64 preemptions = 0;
+        uint64 exhaustedIntents = 0;
+        uint64 hardStalls = 0;
     };
 
     class LazyQuestingScheduler
@@ -565,12 +798,12 @@ namespace
             if (wasEnabled && !_config.enabled)
                 _clearRequested = true;
             else if (!wasEnabled && _config.enabled)
-                _registerExistingRequested = true;
+                _rosterReconcileRequested = true;
         }
 
         void Start()
         {
-            _registerExistingRequested = true;
+            _rosterReconcileRequested = true;
             _nextMetricsAt = SchedulerClock::now() + std::chrono::milliseconds(_config.metricsIntervalMs);
         }
 
@@ -580,7 +813,7 @@ namespace
                 return;
 
             std::lock_guard<std::mutex> lock(_pendingEventsMutex);
-            _pendingEvents.push_back({ type, player->GetGUID().GetRawValue(), 0 });
+            _pendingEvents.push_back({ type, player->GetGUID().GetRawValue() });
         }
 
         void Update()
@@ -594,8 +827,7 @@ namespace
             if (!_config.enabled)
                 return;
 
-            if (_registerExistingRequested)
-                RegisterExistingBots(tickStart);
+            ReconcileStrictRoster(tickStart);
 
             EnsureIndex(tickStart);
             if (!IsLazyQuestIndexReady())
@@ -605,11 +837,16 @@ namespace
             }
 
             auto const budget = std::chrono::milliseconds(_config.worldBudgetMs);
-            SchedulerTime const deadline = tickStart + budget;
-            SchedulerTime const activeSliceDeadline = tickStart + budget * 3 / 4;
+            SchedulerClock::duration const preciseBudget =
+                std::chrono::duration_cast<SchedulerClock::duration>(budget);
+            SchedulerTime const deadline = tickStart + preciseBudget;
+            SchedulerTime const registrationDeadline = tickStart + preciseBudget / 4;
+            SchedulerTime const activeSliceDeadline = tickStart + preciseBudget * 3 / 4;
+            uint32 registrationsProcessed = 0;
             uint32 activeProcessed = 0;
             uint32 discoveryProcessed = 0;
 
+            ProcessRegistrationQueue(registrationDeadline, registrationsProcessed);
             ProcessActiveQueue(activeSliceDeadline, activeProcessed);
             ProcessDiscoveryQueue(deadline, discoveryProcessed);
             ProcessActiveQueue(deadline, activeProcessed);
@@ -627,6 +864,8 @@ namespace
 
     private:
         using ScheduleQueue = std::priority_queue<ScheduledBot, std::vector<ScheduledBot>, ScheduledBotLater>;
+        using RegistrationQueue = std::priority_queue<ScheduledRegistration,
+            std::vector<ScheduledRegistration>, ScheduledRegistrationLater>;
 
         LazyQuestingScheduler() = default;
 
@@ -655,16 +894,9 @@ namespace
                 _discoveryQueue.push(entry);
         }
 
-        bool RegisterBot(Player* player, SchedulerTime now, bool immediate)
+        bool RegisterReadyBot(Player* player, SchedulerTime now, bool immediate)
         {
-            if (!player)
-                return false;
-
-            // Non-strict players are intentionally ignored and must not consume registration retries.
-            if (!IsLazyQuestingBot(player))
-                return true;
-
-            if (!GET_PLAYERBOT_AI(player))
+            if (!player || !IsLazyQuestingBot(player) || !GET_PLAYERBOT_AI(player))
                 return false;
 
             uint64 const guid = player->GetGUID().GetRawValue();
@@ -675,7 +907,70 @@ namespace
             uint32 const jitter = immediate ? 0 : GetGuidJitter(guid, _config.discoveryIntervalMs);
             Schedule(guid, inserted.first->second, ScheduleLane::Discovery,
                      now + std::chrono::milliseconds(jitter));
+            ++_metrics.registrationsCompleted;
             return true;
+        }
+
+        void QueueRegistration(uint64 guid, SchedulerTime now)
+        {
+            if (_states.count(guid) || _registrationRetries.count(guid))
+                return;
+
+            RegistrationRetryState state;
+            state.startedAt = now;
+            state.generation = 1;
+            _registrationRetries.emplace(guid, state);
+            _registrationQueue.push({ now, guid, state.generation });
+        }
+
+        void RetryRegistration(uint64 guid, RegistrationRetryState& state, SchedulerTime now)
+        {
+            if (now - state.startedAt >= std::chrono::milliseconds(REGISTRATION_RETRY_TIMEOUT_MS))
+            {
+                _registrationRetries.erase(guid);
+                ++_metrics.registrationTimeouts;
+                return;
+            }
+
+            uint32 const shift = std::min<uint32>(state.attempts, 5);
+            uint32 const delay = std::min<uint32>(REGISTRATION_RETRY_MIN_MS << shift,
+                                                  REGISTRATION_RETRY_MAX_MS);
+            if (state.attempts < 255)
+                ++state.attempts;
+            ++state.generation;
+            _registrationQueue.push({ now + std::chrono::milliseconds(delay), guid, state.generation });
+            ++_metrics.registrationRetries;
+        }
+
+        void ProcessRegistrationQueue(SchedulerTime deadline, uint32& processed)
+        {
+            while (processed < MAX_REGISTRATIONS_PER_TICK && SchedulerClock::now() < deadline &&
+                   !_registrationQueue.empty())
+            {
+                ScheduledRegistration const entry = _registrationQueue.top();
+                SchedulerTime const now = SchedulerClock::now();
+                if (entry.due > now)
+                    return;
+
+                _registrationQueue.pop();
+                auto retry = _registrationRetries.find(entry.guid);
+                if (retry == _registrationRetries.end() || retry->second.generation != entry.generation)
+                    continue;
+
+                Player* player = ObjectAccessor::FindPlayer(ObjectGuid(entry.guid));
+                if (player && !IsLazyQuestingBot(player))
+                {
+                    _registrationRetries.erase(retry);
+                    continue;
+                }
+
+                if (RegisterReadyBot(player, now, false))
+                    _registrationRetries.erase(retry);
+                else
+                    RetryRegistration(entry.guid, retry->second, now);
+
+                ++processed;
+            }
         }
 
         void WakeBot(Player* player, SchedulerTime now)
@@ -691,16 +986,23 @@ namespace
             }
 
             if (!GET_PLAYERBOT_AI(player))
+            {
+                QueueRegistration(guid, now);
                 return;
+            }
 
-            auto const inserted = _states.try_emplace(guid);
-            LazyBotState& state = inserted.first->second;
+            RegisterReadyBot(player, now, true);
+            auto const inserted = _states.find(guid);
+            if (inserted == _states.end())
+                return;
+            LazyBotState& state = inserted->second;
             state.consecutiveDiscoveryMisses = 0;
             Schedule(guid, state, state.intent.IsActive() ? ScheduleLane::Active : ScheduleLane::Discovery, now);
         }
 
         void RemoveBot(uint64 guid)
         {
+            _registrationRetries.erase(guid);
             auto const stateItr = _states.find(guid);
             if (stateItr == _states.end())
                 return;
@@ -716,7 +1018,6 @@ namespace
         void DrainPendingEvents(SchedulerTime now)
         {
             std::vector<PendingBotEvent> events;
-            std::vector<PendingBotEvent> retries;
             {
                 std::lock_guard<std::mutex> lock(_pendingEventsMutex);
                 std::size_t const count = std::min(_pendingEvents.size(), MAX_PENDING_EVENTS_PER_TICK);
@@ -741,28 +1042,31 @@ namespace
 
                 Player* player = ObjectAccessor::FindPlayer(ObjectGuid(event.guid));
                 if (event.type == PendingBotEventType::Register)
-                {
-                    if (!RegisterBot(player, now, false) && event.attempts < MAX_REGISTRATION_RETRIES)
-                        retries.push_back({ event.type, event.guid, static_cast<uint8>(event.attempts + 1) });
-                }
+                    QueueRegistration(event.guid, now);
                 else
                     WakeBot(player, now);
             }
-
-            if (!retries.empty())
-            {
-                std::lock_guard<std::mutex> lock(_pendingEventsMutex);
-                _pendingEvents.insert(_pendingEvents.end(), retries.begin(), retries.end());
-            }
         }
 
-        void RegisterExistingBots(SchedulerTime now)
+        void ReconcileStrictRoster(SchedulerTime now)
         {
-            _registerExistingRequested = false;
-            std::shared_lock<std::shared_mutex> lock(*HashMapHolder<Player>::GetLock());
-            HashMapHolder<Player>::MapType const& players = ObjectAccessor::GetPlayers();
-            for (auto const& player : players)
-                RegisterBot(player.second, now, false);
+            if (_rosterReconcileRequested ||
+                (_rosterCursor >= _rosterSnapshot.size() && now >= _nextRosterReconcileAt))
+            {
+                _rosterSnapshot.assign(sStrictAltbotMgr->GetRoster().begin(), sStrictAltbotMgr->GetRoster().end());
+                _rosterCursor = 0;
+                _rosterReconcileRequested = false;
+                _nextRosterReconcileAt = now + std::chrono::milliseconds(ROSTER_RECONCILE_INTERVAL_MS);
+            }
+
+            uint32 processed = 0;
+            while (_rosterCursor < _rosterSnapshot.size() && processed < MAX_ROSTER_RECONCILE_PER_TICK)
+            {
+                ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(_rosterSnapshot[_rosterCursor++]);
+                if (ObjectAccessor::FindPlayer(guid))
+                    QueueRegistration(guid.GetRawValue(), now);
+                ++processed;
+            }
         }
 
         void EnsureIndex(SchedulerTime now)
@@ -828,7 +1132,7 @@ namespace
         bool IsTemporarilyUnavailable(Player* player) const
         {
             return !player->IsInWorld() || !player->IsAlive() || player->IsInCombat() ||
-                   player->IsBeingTeleported();
+                   player->IsBeingTeleported() || player->IsInFlight();
         }
 
         void ProcessActiveQueue(SchedulerTime deadline, uint32& processed)
@@ -877,17 +1181,10 @@ namespace
                 return;
             }
 
-            if (IsTemporarilyUnavailable(player))
-            {
-                Schedule(guid, state, ScheduleLane::Active,
-                         now + std::chrono::milliseconds(TRANSIENT_RETRY_MS));
-                return;
-            }
-
             uint32 const nowMs = getMSTime();
             TravelTarget* current = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
 
-            if (!IsIntentValid(player, state.intent))
+            if (!IsIntentQuestStateValid(player, state.intent))
             {
                 ReleaseIntent(player, botAI, state, "quest state changed");
                 Schedule(guid, state, ScheduleLane::Discovery,
@@ -895,20 +1192,87 @@ namespace
                 return;
             }
 
-            UpdateIntentProgress(player, state.intent, nowMs);
-            if (getMSTimeDiff(state.intent.lastProgressAtMs, nowMs) >= NO_PROGRESS_TIMEOUT_MS)
+            bool const semanticProgress = ObserveQuestProgress(player, state.intent);
+            if (semanticProgress)
+                ++_metrics.semanticProgress;
+
+            bool const externallyPreempted = current &&
+                (current->isGroupCopy() || (current->isForced() && !IsTravelTargetForIntent(current, state.intent)));
+            if (IsTemporarilyUnavailable(player) || externallyPreempted)
             {
-                uint32 const stalledQuestId = state.intent.questId;
-                AddQuestCooldown(state, stalledQuestId, now);
-                LOG_WARN("playerbots", "[LQ] {} cooling down stalled quest {} for 20 minutes",
-                         player->GetName(), stalledQuestId);
-                ReleaseIntent(player, botAI, state, "no progress for 5 minutes");
+                if (!state.intent.suspended)
+                    ++_metrics.preemptions;
+                PauseIntentTracking(player, state.intent, nowMs);
+                Schedule(guid, state, ScheduleLane::Active,
+                         now + std::chrono::milliseconds(TRANSIENT_RETRY_MS));
+                return;
+            }
+
+            if (HasEssentialRpgNeed(botAI))
+            {
+                ++_metrics.preemptions;
+                ReleaseIntent(player, botAI, state, "essential RPG service");
                 Schedule(guid, state, ScheduleLane::Discovery,
                          now + std::chrono::milliseconds(_config.discoveryIntervalMs));
                 return;
             }
 
-            MaintainIntent(player, state, current);
+            bool currentActive = false;
+            if (current && IsTravelTargetForIntent(current, state.intent))
+            {
+                if (current->getStatus() == TRAVEL_STATUS_PREPARE)
+                {
+                    PauseIntentTracking(player, state.intent, nowMs);
+                    Schedule(guid, state, ScheduleLane::Active,
+                             now + std::chrono::milliseconds(TRANSIENT_RETRY_MS));
+                    return;
+                }
+
+                currentActive = current->isActive();
+                TravelStatus const status = current->getStatus();
+                if (currentActive && status != TRAVEL_STATUS_COOLDOWN && status != TRAVEL_STATUS_EXPIRED)
+                {
+                    if (current->getDestination() != state.intent.destination ||
+                        current->getPosition() != state.intent.point)
+                        AdoptIntentLeg(player, state.intent, current, nowMs);
+
+                    if (state.intent.type == LazyQuestIntentType::DoQuest && status == TRAVEL_STATUS_WORK)
+                        current->setForced(false);
+
+                    UpdateIntentProgress(player, state.intent, current, nowMs, semanticProgress);
+                }
+            }
+
+            if (!currentActive || IntentNeedsRecovery(state.intent, current))
+            {
+                uint32 const failedQuestId = state.intent.questId;
+                IntentRecoveryResult const recovery =
+                    RecoverIntentLeg(player, state.intent, current, nowMs);
+                if (recovery == IntentRecoveryResult::Repointed)
+                {
+                    ++_metrics.repoints;
+                    Schedule(guid, state, ScheduleLane::Active,
+                             now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
+                    return;
+                }
+
+                bool const hardFailure = recovery == IntentRecoveryResult::HardFailed;
+                AddQuestCooldown(state, failedQuestId, now,
+                                 hardFailure ? FAILED_QUEST_COOLDOWN_MS : EXHAUSTED_QUEST_COOLDOWN_MS);
+                if (hardFailure)
+                    ++_metrics.hardStalls;
+                else
+                    ++_metrics.exhaustedIntents;
+
+                LOG_DEBUG("playerbots", "[LQ] {} deferred {} quest {} after {} failed leg(s)",
+                          player->GetName(), IntentTypeName(state.intent.type), failedQuestId,
+                          state.intent.legFailures);
+                ReleaseIntent(player, botAI, state, hardFailure ? "hard quest stall" : "no alternate quest leg");
+                Schedule(guid, state, ScheduleLane::Discovery,
+                         now + std::chrono::milliseconds(_config.discoveryIntervalMs));
+                return;
+            }
+
             bool const interacted = TryQuestInteraction(player, botAI, state.intent, current, nowMs);
             Schedule(guid, state, ScheduleLane::Active,
                      now + std::chrono::milliseconds(interacted ? POST_INTERACTION_RETRY_MS
@@ -988,8 +1352,7 @@ namespace
             }
 
             AcquireIntent(player, botAI, state, candidate, getMSTime());
-            current->setTarget(candidate.destination, candidate.point);
-            current->setForced(candidate.type != LazyQuestIntentType::DoQuest);
+            AssignIntentLeg(player, state.intent, current, candidate, getMSTime());
             Schedule(guid, state, ScheduleLane::Active,
                      now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
         }
@@ -1011,11 +1374,17 @@ namespace
                 : 0.0;
 
             LOG_INFO("playerbots",
-                     "[LQ] scheduler: bots={}, intents={}, queues={}/{}, processed={}/{}, "
-                     "selector avg/max={:.0f}/{}us, indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}",
-                     _states.size(), activeIntents, _activeQueue.size(), _discoveryQueue.size(),
-                     _metrics.activeProcessed, _metrics.discoveryProcessed, averageDiscoveryMicros,
-                     _metrics.discoveryMaxMicros, _metrics.indexedPointsVisited,
+                     "[LQ] scheduler: roster/registered/pending={}/{}/{}, intents={}, queues={}/{}, "
+                     "processed={}/{}, registrations={}/{}/{}, progress/repoints/preemptions={}/{}/{}, "
+                     "exhausted/hard-stalls={}/{}, selector avg/max={:.0f}/{}us, "
+                     "indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}",
+                     sStrictAltbotMgr->GetRosterSize(), _states.size(), _registrationRetries.size(),
+                     activeIntents, _activeQueue.size(), _discoveryQueue.size(),
+                     _metrics.activeProcessed, _metrics.discoveryProcessed,
+                     _metrics.registrationsCompleted, _metrics.registrationRetries,
+                     _metrics.registrationTimeouts, _metrics.semanticProgress, _metrics.repoints,
+                     _metrics.preemptions, _metrics.exhaustedIntents, _metrics.hardStalls,
+                     averageDiscoveryMicros, _metrics.discoveryMaxMicros, _metrics.indexedPointsVisited,
                      _metrics.pickupDestinationsEvaluated, _metrics.candidatesFound,
                      _metrics.budgetLimitedTicks);
 
@@ -1036,6 +1405,11 @@ namespace
             _states.clear();
             _activeQueue = {};
             _discoveryQueue = {};
+            _registrationRetries.clear();
+            _registrationQueue = {};
+            _rosterSnapshot.clear();
+            _rosterCursor = 0;
+            _nextRosterReconcileAt = SchedulerTime::min();
             _clearRequested = false;
         }
 
@@ -1043,13 +1417,18 @@ namespace
         std::unordered_map<uint64, LazyBotState> _states;
         ScheduleQueue _activeQueue;
         ScheduleQueue _discoveryQueue;
+        std::unordered_map<uint64, RegistrationRetryState> _registrationRetries;
+        RegistrationQueue _registrationQueue;
+        std::vector<uint32> _rosterSnapshot;
+        std::size_t _rosterCursor = 0;
         std::mutex _pendingEventsMutex;
         std::deque<PendingBotEvent> _pendingEvents;
         SchedulerMetrics _metrics;
         SchedulerTime _nextIndexAttempt = SchedulerTime::min();
         SchedulerTime _nextMetricsAt = SchedulerTime::max();
+        SchedulerTime _nextRosterReconcileAt = SchedulerTime::min();
         bool _clearRequested = false;
-        bool _registerExistingRequested = false;
+        bool _rosterReconcileRequested = false;
     };
 }
 
