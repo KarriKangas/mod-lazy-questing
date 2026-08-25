@@ -8,6 +8,7 @@
 #include "PlayerScript.h"
 #include "QuestDef.h"
 #include "ScriptMgr.h"
+#include "StrictAltbotMgr.h"
 #include "TravelMgr.h"
 
 #include <algorithm>
@@ -75,6 +76,11 @@ namespace
         config.metricsIntervalMs = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.MetricsIntervalMs", 60000), 10000, 3600000);
         return config;
+    }
+
+    bool IsLazyQuestingBot(Player* player)
+    {
+        return player && sStrictAltbotMgr->IsStrictAltbot(player->GetGUID().GetCounter());
     }
 
     char const* IntentTypeName(LazyQuestIntentType type)
@@ -570,7 +576,7 @@ namespace
 
         void QueueEvent(PendingBotEventType type, Player* player)
         {
-            if (!player)
+            if (!player || (type != PendingBotEventType::Remove && !IsLazyQuestingBot(player)))
                 return;
 
             std::lock_guard<std::mutex> lock(_pendingEventsMutex);
@@ -651,7 +657,14 @@ namespace
 
         bool RegisterBot(Player* player, SchedulerTime now, bool immediate)
         {
-            if (!player || !GET_PLAYERBOT_AI(player))
+            if (!player)
+                return false;
+
+            // Non-strict players are intentionally ignored and must not consume registration retries.
+            if (!IsLazyQuestingBot(player))
+                return true;
+
+            if (!GET_PLAYERBOT_AI(player))
                 return false;
 
             uint64 const guid = player->GetGUID().GetRawValue();
@@ -667,10 +680,19 @@ namespace
 
         void WakeBot(Player* player, SchedulerTime now)
         {
-            if (!player || !GET_PLAYERBOT_AI(player))
+            if (!player)
                 return;
 
             uint64 const guid = player->GetGUID().GetRawValue();
+            if (!IsLazyQuestingBot(player))
+            {
+                RemoveBot(guid);
+                return;
+            }
+
+            if (!GET_PLAYERBOT_AI(player))
+                return;
+
             auto const inserted = _states.try_emplace(guid);
             LazyBotState& state = inserted.first->second;
             state.consecutiveDiscoveryMisses = 0;
@@ -789,6 +811,14 @@ namespace
             if (!player || !botAI)
             {
                 _states.erase(guid);
+                return false;
+            }
+
+            if (!IsLazyQuestingBot(player))
+            {
+                RemoveBot(guid);
+                player = nullptr;
+                botAI = nullptr;
                 return false;
             }
 
