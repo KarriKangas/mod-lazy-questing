@@ -9,7 +9,9 @@
 namespace
 {
     constexpr float MAX_QUEST_DISTANCE = 2500.0f;
+    constexpr float LOCAL_QUEST_PICKUP_DISTANCE = 250.0f;
     constexpr float QUEST_CLUSTER_RADIUS = 400.0f;
+    constexpr uint32 DESIRED_ACTIVE_QUESTS = 3;
 
     struct RankedQuestCandidate
     {
@@ -37,6 +39,23 @@ namespace
 
         return count;
     }
+
+    RankedQuestCandidate const* FindNearestCandidate(std::vector<RankedQuestCandidate> const& candidates,
+                                                      LazyQuestIntentType type)
+    {
+        RankedQuestCandidate const* nearest = nullptr;
+
+        for (RankedQuestCandidate const& current : candidates)
+        {
+            if (current.candidate.type != type)
+                continue;
+
+            if (!nearest || current.candidate.distance < nearest->candidate.distance)
+                nearest = &current;
+        }
+
+        return nearest;
+    }
 }
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
@@ -47,6 +66,7 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
 
     WorldPosition botPosition(bot);
     std::vector<RankedQuestCandidate> candidates;
+    std::unordered_set<uint32> activeQuestIds;
 
     for (auto const& quest : bot->getQuestStatusMap())
     {
@@ -93,26 +113,66 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
             ranked.candidate.distance = distance;
             ranked.clusterPoint = destination->nearestPoint(&botPosition);
             candidates.push_back(ranked);
+
+            if (ranked.candidate.type == LazyQuestIntentType::DoQuest)
+                activeQuestIds.insert(questId);
         }
+    }
+
+    // Stock Playerbots discovers available quest givers but fails to build the point list needed
+    // to select one. Reuse those already-filtered destinations so bots can deliberately refill
+    // sparse quest logs and pick up follow-up quests while they are still near the quest hub.
+    float const pickupSearchDistance = 400.0f + bot->GetLevel() * 10.0f;
+    std::vector<TravelDestination*> pickupDestinations =
+        TravelMgr::instance().getQuestTravelDestinations(bot, -1, true, false, pickupSearchDistance);
+
+    for (TravelDestination* destination : pickupDestinations)
+    {
+        if (!destination || !destination->isActive(bot))
+            continue;
+
+        Quest const* quest = destination->GetQuestTemplate();
+        if (!quest || (excludedQuestIds && excludedQuestIds->count(quest->GetQuestId())))
+            continue;
+
+        std::vector<WorldPosition*> points = destination->nextPoint(&botPosition);
+        if (points.empty())
+            continue;
+
+        WorldPosition* point = points.front();
+        float const distance = point->distance(&botPosition);
+        if (distance > pickupSearchDistance)
+            continue;
+
+        RankedQuestCandidate ranked;
+        ranked.candidate.destination = destination;
+        ranked.candidate.point = point;
+        ranked.candidate.questId = quest->GetQuestId();
+        ranked.candidate.type = LazyQuestIntentType::PickUp;
+        ranked.candidate.distance = distance;
+        ranked.clusterPoint = destination->nearestPoint(&botPosition);
+        candidates.push_back(ranked);
     }
 
     if (candidates.empty())
         return false;
 
     // Turning in completed quests remains the highest priority. Keep the old behavior: nearest turn-in wins.
-    RankedQuestCandidate const* nearestTurnIn = nullptr;
-    for (RankedQuestCandidate const& current : candidates)
-    {
-        if (current.candidate.type != LazyQuestIntentType::TurnIn)
-            continue;
-
-        if (!nearestTurnIn || current.candidate.distance < nearestTurnIn->candidate.distance)
-            nearestTurnIn = &current;
-    }
+    RankedQuestCandidate const* nearestTurnIn = FindNearestCandidate(candidates, LazyQuestIntentType::TurnIn);
 
     if (nearestTurnIn)
     {
         candidate = nearestTurnIn->candidate;
+        return true;
+    }
+
+    // Pick up follow-ups and other quests in the current hub. Travel farther for a new quest only
+    // when the bot has too little actionable quest work to keep questing productively.
+    RankedQuestCandidate const* nearestPickup = FindNearestCandidate(candidates, LazyQuestIntentType::PickUp);
+    if (nearestPickup && (nearestPickup->candidate.distance <= LOCAL_QUEST_PICKUP_DISTANCE ||
+                          activeQuestIds.size() < DESIRED_ACTIVE_QUESTS))
+    {
+        candidate = nearestPickup->candidate;
         return true;
     }
 
@@ -136,7 +196,13 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
     }
 
     if (!bestQuestWork)
-        return false;
+    {
+        if (!nearestPickup)
+            return false;
+
+        candidate = nearestPickup->candidate;
+        return true;
+    }
 
     candidate = bestQuestWork->candidate;
     return true;

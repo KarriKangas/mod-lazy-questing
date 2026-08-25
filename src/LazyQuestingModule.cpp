@@ -22,6 +22,8 @@ namespace
     {
         switch (type)
         {
+            case LazyQuestIntentType::PickUp:
+                return "pick-up";
             case LazyQuestIntentType::TurnIn:
                 return "turn-in";
             case LazyQuestIntentType::DoQuest:
@@ -139,12 +141,16 @@ namespace
             return false;
 
         uint8 status = bot->GetQuestStatus(intent.questId);
-        if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+        if (status != QUEST_STATUS_NONE && status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
             return false;
 
-        LazyQuestIntentType currentType = status == QUEST_STATUS_COMPLETE
-            ? LazyQuestIntentType::TurnIn
-            : LazyQuestIntentType::DoQuest;
+        LazyQuestIntentType currentType;
+        if (status == QUEST_STATUS_NONE)
+            currentType = LazyQuestIntentType::PickUp;
+        else if (status == QUEST_STATUS_COMPLETE)
+            currentType = LazyQuestIntentType::TurnIn;
+        else
+            currentType = LazyQuestIntentType::DoQuest;
         return currentType == intent.type;
     }
 

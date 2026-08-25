@@ -11,6 +11,7 @@ class WorldPosition;
 
 enum class LazyQuestIntentType : uint8
 {
+    PickUp,
     DoQuest,
     TurnIn,
 };
