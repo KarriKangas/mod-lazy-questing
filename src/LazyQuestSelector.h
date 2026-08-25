@@ -3,6 +3,7 @@
 
 #include "Define.h"
 
+#include <cstddef>
 #include <unordered_set>
 
 class Player;
@@ -25,8 +26,26 @@ struct LazyQuestCandidate
     float distance = 0.0f;
 };
 
+struct LazyQuestSelectionStats
+{
+    uint32 indexedPointsVisited = 0;
+    uint32 pickupDestinationsEvaluated = 0;
+    uint32 candidatesFound = 0;
+};
+
+struct LazyQuestIndexStats
+{
+    std::size_t cells = 0;
+    std::size_t points = 0;
+};
+
+bool InitializeLazyQuestIndex();
+bool IsLazyQuestIndexReady();
+LazyQuestIndexStats GetLazyQuestIndexStats();
+
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
-                            std::unordered_set<uint32> const* excludedQuestIds = nullptr);
+                            std::unordered_set<uint32> const* excludedQuestIds = nullptr,
+                            LazyQuestSelectionStats* stats = nullptr);
 bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, LazyQuestIntentType type);
 
 #endif
