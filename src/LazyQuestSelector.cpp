@@ -8,6 +8,7 @@
 #include "QuestValues.h"
 #include "TravelMgr.h"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <unordered_map>
@@ -193,7 +194,42 @@ namespace
         return false;
     }
 
-    WorldPosition* FindNearestSpawnOnMap(int32 entry, WorldPosition const& botPosition, float maxDistance)
+    bool IsExcludedPoint(WorldPosition* point, std::vector<WorldPosition*> const* excludedPoints)
+    {
+        return excludedPoints && std::find(excludedPoints->begin(), excludedPoints->end(), point) !=
+            excludedPoints->end();
+    }
+
+    WorldPosition* FindNearestDestinationPointOnMap(TravelDestination* destination,
+                                                     WorldPosition const& botPosition,
+                                                     float maxDistance,
+                                                     std::vector<WorldPosition*> const* excludedPoints = nullptr)
+    {
+        if (!destination)
+            return nullptr;
+
+        WorldPosition* nearest = nullptr;
+        float nearestDistance = maxDistance;
+
+        for (WorldPosition* point : destination->getPoints())
+        {
+            if (!point || point->GetMapId() != botPosition.GetMapId() || IsExcludedPoint(point, excludedPoints))
+                continue;
+
+            float const distance = point->distance(botPosition);
+            if (distance <= maxDistance && (!nearest || distance < nearestDistance))
+            {
+                nearest = point;
+                nearestDistance = distance;
+            }
+        }
+
+        return nearest;
+    }
+
+    WorldPosition* FindNearestSpawnOnMap(int32 entry, WorldPosition const& botPosition, float maxDistance,
+                                         std::vector<WorldPosition*> const* excludedPoints = nullptr,
+                                         bool skipOccupied = false)
     {
         auto positions = spawnPositions.find(entry);
         if (positions == spawnPositions.end())
@@ -204,7 +240,8 @@ namespace
 
         for (WorldPosition& point : positions->second)
         {
-            if (point.GetMapId() != botPosition.GetMapId())
+            if (point.GetMapId() != botPosition.GetMapId() || IsExcludedPoint(&point, excludedPoints) ||
+                (skipOccupied && point.getVisitors() > 0))
                 continue;
 
             float const distance = point.distance(botPosition);
@@ -542,12 +579,12 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                 if (!IsQuestRelationActive(bot, destination, LazyQuestIntentType::TurnIn, activeQuestCount))
                     continue;
 
-                std::vector<WorldPosition*> points = destination->nextPoint(&botPosition);
-                if (points.empty() || !points.front() || points.front()->GetMapId() != bot->GetMapId() ||
-                    points.front()->distance(&botPosition) > MAX_QUEST_DISTANCE)
+                WorldPosition* point =
+                    FindNearestDestinationPointOnMap(destination, botPosition, MAX_QUEST_DISTANCE);
+                if (!point)
                     continue;
 
-                AddRankedCandidate(candidates, destination, points.front(), questId,
+                AddRankedCandidate(candidates, destination, point, questId,
                                    LazyQuestIntentType::TurnIn, botPosition, stats);
             }
 
@@ -560,7 +597,8 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
 
         for (ObjectiveKey const& objective : objectives->second)
         {
-            WorldPosition* point = FindNearestSpawnOnMap(objective.entry, botPosition, MAX_QUEST_DISTANCE);
+            WorldPosition* point =
+                FindNearestSpawnOnMap(objective.entry, botPosition, MAX_QUEST_DISTANCE, nullptr, true);
             if (!point)
                 continue;
 
@@ -610,12 +648,9 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                 !IsQuestRelationActive(bot, destination, LazyQuestIntentType::PickUp, activeQuestCount))
                 continue;
 
-            std::vector<WorldPosition*> points = destination->nextPoint(&botPosition);
-            if (points.empty() || !points.front() || points.front()->GetMapId() != bot->GetMapId())
-                continue;
-
-            WorldPosition* point = points.front();
-            if (point->distance(&botPosition) > pickupSearchDistance)
+            WorldPosition* point =
+                FindNearestDestinationPointOnMap(destination, botPosition, pickupSearchDistance);
+            if (!point)
                 continue;
 
             AddRankedCandidate(candidates, destination, point, quest->GetQuestId(),
@@ -661,5 +696,72 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
         return false;
 
     candidate = bestQuestWork->candidate;
+    return true;
+}
+
+bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
+                      TravelDestination* preferredDestination,
+                      std::vector<WorldPosition*> const& excludedPoints,
+                      LazyQuestCandidate& candidate)
+{
+    if (!bot || !pickupIndexReady || !questId)
+        return false;
+
+    WorldPosition botPosition(bot);
+    LazyQuestCandidate best;
+    bool found = false;
+
+    auto consider = [&](TravelDestination* destination, WorldPosition* point)
+    {
+        if (!destination || !point)
+            return;
+
+        float const distance = point->distance(botPosition);
+        if (distance > MAX_QUEST_DISTANCE || (found && distance >= best.distance))
+            return;
+
+        best = { destination, point, questId, type, distance };
+        found = true;
+    };
+
+    if (type == LazyQuestIntentType::DoQuest)
+    {
+        auto const objectives = questObjectives.find(questId);
+        if (objectives == questObjectives.end())
+            return false;
+
+        for (ObjectiveKey const& objective : objectives->second)
+        {
+            QuestObjectiveTravelDestination* destination = GetOrCreateObjectiveDestination(objective);
+            if (!destination || (destination != preferredDestination && !destination->isActive(bot)))
+                continue;
+
+            WorldPosition* point = FindNearestSpawnOnMap(
+                objective.entry, botPosition, MAX_QUEST_DISTANCE, &excludedPoints, true);
+            consider(destination, point);
+        }
+    }
+    else
+    {
+        auto const relations = questRelations.find(questId);
+        if (relations == questRelations.end())
+            return false;
+
+        uint32 const activeQuestCount = CountActiveQuests(bot);
+        for (QuestRelationTravelDestination* destination : relations->second)
+        {
+            if (!IsQuestRelationActive(bot, destination, type, activeQuestCount))
+                continue;
+
+            WorldPosition* point = FindNearestDestinationPointOnMap(
+                destination, botPosition, MAX_QUEST_DISTANCE, &excludedPoints);
+            consider(destination, point);
+        }
+    }
+
+    if (!found)
+        return false;
+
+    candidate = best;
     return true;
 }

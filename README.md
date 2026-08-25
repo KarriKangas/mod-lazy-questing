@@ -17,6 +17,19 @@ so discovery does not scan every quest giver for every bot or block SOAP/CLI
 processing. Candidate eligibility uses direct quest dialog checks instead of
 creating permanent candidate-specific Playerbots AI values.
 
+Login registration is retried with bounded exponential backoff while the
+Playerbots AI is still being constructed. A periodic reconciliation against
+the strict Altbot roster recovers missed login hooks without scanning every
+online player.
+
+Quest intent and the current travel leg are tracked separately. Combat, taxi
+travel, teleports, group travel, and essential vendor or repair activity do not
+count as quest stalls. When eligible work really stops moving or progressing,
+the scheduler tries another unvisited spawn, objective source, or quest giver
+before applying a bounded quest cooldown. Objective points are selected by
+distance and existing visitors, which spreads a large cohort across available
+spawns instead of concentrating it at a random point.
+
 ## Requirements
 
 - AzerothCore
@@ -31,7 +44,8 @@ as bot counts grow:
 - active intents are maintained every 5 seconds;
 - idle discovery starts at 30 seconds and backs off to 2 minutes after misses;
 - scheduler work is limited to 2 milliseconds per world tick;
-- aggregate scheduler and selector metrics are logged once per minute.
+- aggregate registration, progress, recovery, scheduler, and selector metrics
+  are logged once per minute.
 
 Quest completion, level changes, and map changes wake the affected bot without
 waiting for its polling interval. The module has no SQL or commands.
