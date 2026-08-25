@@ -1,12 +1,15 @@
 # mod-lazy-questing
 
-An AzerothCore module for lazy questing behavior powered by
-[mod-playerbots](https://github.com/mod-playerbots/mod-playerbots).
+An AzerothCore module for lazy questing behavior for active strict Altbots,
+powered by [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots)
+and mod-strict-altbot-guild.
 
 The module periodically finds the nearest active quest destination for
-out-of-combat Playerbots and can replace idle, grinding, exploring, or
-nonessential RPG travel with focused quest work. It supports nearby quest
-pickup, objective travel, turn-in, and direct interaction with quest givers.
+out-of-combat Playerbots registered in the mod-strict-altbot-guild roster and
+can replace idle, grinding, exploring, or nonessential RPG travel with focused
+quest work. Normal Playerbots are never registered with the lazy-questing
+scheduler. It supports nearby quest pickup, objective travel, turn-in, and
+direct interaction with quest givers.
 
 Pickup destinations are indexed once by map and spatial cell. Bot work is
 staggered through a central scheduler with a strict per-world-tick time budget,
@@ -18,6 +21,7 @@ creating permanent candidate-specific Playerbots AI values.
 
 - AzerothCore
 - mod-playerbots checked out alongside this module
+- mod-strict-altbot-guild checked out alongside this module
 
 ## Configuration
 
