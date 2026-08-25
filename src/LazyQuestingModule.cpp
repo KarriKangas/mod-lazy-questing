@@ -481,12 +481,14 @@ namespace
         float const x = bot->GetPositionX();
         float const y = bot->GetPositionY();
         float const z = bot->GetPositionZ();
+        bool resetMovementAnchor = false;
 
         if (currentMapId != intent.lastMapId)
         {
             intent.noMovementMs = 0;
             intent.noApproachMs = 0;
             intent.bestDistance = 0.0f;
+            resetMovementAnchor = true;
         }
         else
         {
@@ -495,7 +497,10 @@ namespace
             float const dz = z - intent.lastZ;
             float const movement = std::sqrt(dx * dx + dy * dy + dz * dz);
             if (movement >= MOVEMENT_PROGRESS_YARDS)
+            {
                 intent.noMovementMs = 0;
+                resetMovementAnchor = true;
+            }
             else
                 intent.noMovementMs += elapsedMs;
         }
@@ -519,9 +524,12 @@ namespace
             intent.noWorkProgressMs = 0;
 
         intent.lastMapId = currentMapId;
-        intent.lastX = x;
-        intent.lastY = y;
-        intent.lastZ = z;
+        if (resetMovementAnchor)
+        {
+            intent.lastX = x;
+            intent.lastY = y;
+            intent.lastZ = z;
+        }
     }
 
     enum class IntentRecoveryResult : uint8
