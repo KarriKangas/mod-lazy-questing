@@ -429,6 +429,8 @@ namespace
         ResetIntentLegTracking(bot, intent, nowMs);
 
         current->setTarget(candidate.destination, candidate.point);
+        if (intent.type != LazyQuestIntentType::DoQuest)
+            current->setRadius(INTERACTION_DISTANCE);
         // Forced travel prevents an empty spawn from invalidating the destination before the bot reaches
         // the selected alternate point. Objective work becomes non-forced again on arrival.
         current->setForced(true);
@@ -441,6 +443,8 @@ namespace
         intent.lastInteractionAtMs = 0;
         intent.interactionFailures = 0;
         ResetIntentLegTracking(bot, intent, nowMs);
+        if (intent.type != LazyQuestIntentType::DoQuest)
+            current->setRadius(INTERACTION_DISTANCE);
     }
 
     bool ObserveQuestProgress(Player* bot, LazyQuestIntent& intent)
