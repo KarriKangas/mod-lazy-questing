@@ -95,20 +95,42 @@ namespace
         return target->getDestination()->isActive(bot);
     }
 
-    bool ShouldNudge(Player* bot, TravelTarget* current)
+    bool HasEssentialRpgNeed(PlayerbotAI* botAI)
+    {
+        AiObjectContext* context = botAI->GetAiObjectContext();
+        bool const needsVendor =
+            context->GetValue<bool>("group or", "should sell,can sell,following party,near leader")->Get();
+        bool const needsRepair =
+            context->GetValue<bool>("group or", "should repair,can repair,following party,near leader")->Get();
+        return needsVendor || needsRepair;
+    }
+
+    bool ShouldNudge(Player* bot, PlayerbotAI* botAI, TravelTarget* current)
     {
         if (!current)
             return false;
 
-        if (current->isForced() || current->isGroupCopy())
+        if (current->isGroupCopy())
             return false;
 
         TravelDestination* destination = current->getDestination();
-        if (!destination || IsLowValueTarget(destination))
-            return true;
 
         if (dynamic_cast<RpgTravelDestination*>(destination))
+        {
+            // Playerbots marks its incidental RPG fallback as forced. Allow a quest to reclaim
+            // masterless bots once selling/repairing is no longer needed, but preserve explicit
+            // travel commands from an active player master.
+            if (HasEssentialRpgNeed(botAI) || (current->isForced() && botAI->HasActivePlayerMaster()))
+                return false;
+
+            return true;
+        }
+
+        if (current->isForced())
             return false;
+
+        if (!destination || IsLowValueTarget(destination))
+            return true;
 
         return !IsUsableTarget(bot, current);
     }
@@ -334,7 +356,7 @@ public:
 
         std::unordered_set<uint32> coolingDown = GetCoolingDownQuests(state, now);
         LazyQuestCandidate candidate;
-        if (!FindLazyQuestCandidate(player, candidate, &coolingDown) || !ShouldNudge(player, current))
+        if (!FindLazyQuestCandidate(player, candidate, &coolingDown) || !ShouldNudge(player, botAI, current))
             return;
 
         AcquireIntent(player, botAI, state, candidate, now);
