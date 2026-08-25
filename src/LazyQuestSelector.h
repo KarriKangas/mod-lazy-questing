@@ -27,5 +27,6 @@ struct LazyQuestCandidate
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds = nullptr);
+bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, LazyQuestIntentType type);
 
 #endif
