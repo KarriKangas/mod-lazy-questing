@@ -1,0 +1,21 @@
+####################################################################################################
+# MOD LAZY QUESTING
+####################################################################################################
+
+# Enable the module's scheduler and quest intents.
+LazyQuesting.Enable = 1
+
+# Cheap validation, travel maintenance, and nearby quest interaction cadence for bots with an intent.
+LazyQuesting.ActiveCheckIntervalMs = 5000
+
+# Base and maximum backoff for bots looking for new work. Successful world events wake bots immediately.
+LazyQuesting.DiscoveryIntervalMs = 30000
+LazyQuesting.MaxDiscoveryBackoffMs = 120000
+
+# Hard scheduler limits. The time budget is shared by active maintenance and discovery each world tick.
+LazyQuesting.WorldBudgetMs = 2
+LazyQuesting.MaxActiveBotsPerTick = 64
+LazyQuesting.MaxDiscoveryBotsPerTick = 4
+
+# Emit one aggregate scheduler health line at this interval. Per-bot lifecycle messages are debug-level.
+LazyQuesting.MetricsIntervalMs = 60000
