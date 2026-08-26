@@ -544,7 +544,7 @@ bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, L
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds,
-                            LazyQuestSelectionStats* stats)
+                            LazyQuestSelectionStats* stats, bool allowQuestWork)
 {
     if (!bot || !pickupIndexReady)
         return false;
@@ -591,23 +591,26 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
             continue;
         }
 
-        auto const objectives = questObjectives.find(questId);
-        if (objectives == questObjectives.end())
-            continue;
-
-        for (ObjectiveKey const& objective : objectives->second)
+        if (allowQuestWork)
         {
-            WorldPosition* point =
-                FindNearestSpawnOnMap(objective.entry, botPosition, MAX_QUEST_DISTANCE, nullptr, true);
-            if (!point)
+            auto const objectives = questObjectives.find(questId);
+            if (objectives == questObjectives.end())
                 continue;
 
-            QuestObjectiveTravelDestination* destination = GetOrCreateObjectiveDestination(objective);
-            if (!destination || !destination->isActive(bot))
-                continue;
+            for (ObjectiveKey const& objective : objectives->second)
+            {
+                WorldPosition* point =
+                    FindNearestSpawnOnMap(objective.entry, botPosition, MAX_QUEST_DISTANCE, nullptr, true);
+                if (!point)
+                    continue;
 
-            AddRankedCandidate(candidates, destination, point, questId,
-                               LazyQuestIntentType::DoQuest, botPosition, stats);
+                QuestObjectiveTravelDestination* destination = GetOrCreateObjectiveDestination(objective);
+                if (!destination || !destination->isActive(bot))
+                    continue;
+
+                AddRankedCandidate(candidates, destination, point, questId,
+                                   LazyQuestIntentType::DoQuest, botPosition, stats);
+            }
         }
     }
 

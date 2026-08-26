@@ -46,7 +46,8 @@ LazyQuestIndexStats GetLazyQuestIndexStats();
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds = nullptr,
-                            LazyQuestSelectionStats* stats = nullptr);
+                            LazyQuestSelectionStats* stats = nullptr,
+                            bool allowQuestWork = true);
 bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
                       TravelDestination* preferredDestination,
                       std::vector<WorldPosition*> const& excludedPoints,

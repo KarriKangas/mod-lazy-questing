@@ -28,6 +28,13 @@ namespace
     using SchedulerClock = std::chrono::steady_clock;
     using SchedulerTime = SchedulerClock::time_point;
 
+    enum class LazyQuestExperimentMode : uint8
+    {
+        Control,
+        AssistOnly,
+        Current,
+    };
+
     constexpr uint32 NO_MOVEMENT_TIMEOUT_MS = MINUTE * IN_MILLISECONDS;
     constexpr uint32 NO_APPROACH_TIMEOUT_MS = 3 * MINUTE * IN_MILLISECONDS;
     constexpr uint32 NO_WORK_PROGRESS_TIMEOUT_MS = 2 * MINUTE * IN_MILLISECONDS;
@@ -61,6 +68,9 @@ namespace
         uint32 maxActiveBotsPerTick = 64;
         uint32 maxDiscoveryBotsPerTick = 4;
         uint32 metricsIntervalMs = MINUTE * IN_MILLISECONDS;
+        uint32 experimentSeed = 1;
+        uint32 experimentControlPercent = 0;
+        uint32 experimentAssistOnlyPercent = 0;
     };
 
     uint32 ClampConfig(uint32 value, uint32 minimum, uint32 maximum)
@@ -87,7 +97,54 @@ namespace
             sConfigMgr->GetOption<uint32>("LazyQuesting.MaxDiscoveryBotsPerTick", 4), 1, 100);
         config.metricsIntervalMs = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.MetricsIntervalMs", 60000), 10000, 3600000);
+        config.experimentSeed = sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.Seed", 1);
+        config.experimentControlPercent = ClampConfig(
+            sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.ControlPercent", 0), 0, 100);
+        config.experimentAssistOnlyPercent = ClampConfig(
+            sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.AssistOnlyPercent", 0), 0,
+            100 - config.experimentControlPercent);
         return config;
+    }
+
+    char const* ExperimentModeName(LazyQuestExperimentMode mode)
+    {
+        switch (mode)
+        {
+            case LazyQuestExperimentMode::Control:
+                return "control";
+            case LazyQuestExperimentMode::AssistOnly:
+                return "assist-only";
+            case LazyQuestExperimentMode::Current:
+            default:
+                return "current";
+        }
+    }
+
+    uint32 GetExperimentBucket(Player const* player, uint32 seed)
+    {
+        uint64 value = player->GetGUID().GetCounter();
+        value ^= static_cast<uint64>(player->getRace()) << 48;
+        value ^= static_cast<uint64>(player->getClass()) << 56;
+        value ^= static_cast<uint64>(seed) * 0x9e3779b97f4a7c15ULL;
+        value ^= value >> 33;
+        value *= 0xff51afd7ed558ccdULL;
+        value ^= value >> 33;
+        value *= 0xc4ceb9fe1a85ec53ULL;
+        value ^= value >> 33;
+        return static_cast<uint32>(value % 100);
+    }
+
+    LazyQuestExperimentMode GetExperimentMode(Player const* player, LazyQuestingConfig const& config)
+    {
+        if (!config.enabled)
+            return LazyQuestExperimentMode::Control;
+
+        uint32 const bucket = GetExperimentBucket(player, config.experimentSeed);
+        if (bucket < config.experimentControlPercent)
+            return LazyQuestExperimentMode::Control;
+        if (bucket < config.experimentControlPercent + config.experimentAssistOnlyPercent)
+            return LazyQuestExperimentMode::AssistOnly;
+        return LazyQuestExperimentMode::Current;
     }
 
     bool IsLazyQuestingBot(Player* player)
@@ -171,6 +228,7 @@ namespace
     {
         LazyQuestIntent intent;
         std::unordered_map<uint32, SchedulerTime> questRetryAfter;
+        LazyQuestExperimentMode experimentMode = LazyQuestExperimentMode::Current;
         uint64 scheduleGeneration = 0;
         ScheduleLane scheduledLane = ScheduleLane::Discovery;
         uint8 consecutiveDiscoveryMisses = 0;
@@ -782,12 +840,21 @@ namespace
         void Configure(LazyQuestingConfig const& config)
         {
             bool const wasEnabled = _config.enabled;
+            bool const experimentChanged = _config.experimentSeed != config.experimentSeed ||
+                _config.experimentControlPercent != config.experimentControlPercent ||
+                _config.experimentAssistOnlyPercent != config.experimentAssistOnlyPercent;
             _config = config;
 
             if (wasEnabled && !_config.enabled)
                 _clearRequested = true;
             else if (!wasEnabled && _config.enabled)
                 _rosterReconcileRequested = true;
+
+            if (_config.enabled && experimentChanged)
+            {
+                _clearRequested = true;
+                _rosterReconcileRequested = true;
+            }
         }
 
         void Start()
@@ -889,20 +956,34 @@ namespace
                 return false;
 
             uint64 const guid = player->GetGUID().GetRawValue();
+            LazyQuestExperimentMode const experimentMode = GetExperimentMode(player, _config);
+            if (experimentMode == LazyQuestExperimentMode::Control)
+            {
+                _controlBots.insert(guid);
+                return true;
+            }
+
+            _controlBots.erase(guid);
             auto const inserted = _states.try_emplace(guid);
             if (!inserted.second)
+            {
+                inserted.first->second.experimentMode = experimentMode;
                 return true;
+            }
 
+            inserted.first->second.experimentMode = experimentMode;
             uint32 const jitter = immediate ? 0 : GetGuidJitter(guid, _config.discoveryIntervalMs);
             Schedule(guid, inserted.first->second, ScheduleLane::Discovery,
                      now + std::chrono::milliseconds(jitter));
             ++_metrics.registrationsCompleted;
+            LOG_DEBUG("playerbots", "[LQ] {} assigned to experiment mode {}", player->GetName(),
+                      ExperimentModeName(experimentMode));
             return true;
         }
 
         void QueueRegistration(uint64 guid, SchedulerTime now)
         {
-            if (_states.count(guid) || _registrationRetries.count(guid))
+            if (_states.count(guid) || _controlBots.count(guid) || _registrationRetries.count(guid))
                 return;
 
             RegistrationRetryState state;
@@ -992,6 +1073,7 @@ namespace
         void RemoveBot(uint64 guid)
         {
             _registrationRetries.erase(guid);
+            _controlBots.erase(guid);
             auto const stateItr = _states.find(guid);
             if (stateItr == _states.end())
                 return;
@@ -1328,7 +1410,9 @@ namespace
             LazyQuestCandidate candidate;
             LazyQuestSelectionStats selectionStats;
             SchedulerTime const selectionStart = SchedulerClock::now();
-            bool const found = FindLazyQuestCandidate(player, candidate, &coolingDown, &selectionStats);
+            bool const allowQuestWork = state.experimentMode == LazyQuestExperimentMode::Current;
+            bool const found = FindLazyQuestCandidate(player, candidate, &coolingDown, &selectionStats,
+                                                      allowQuestWork);
             uint64 const selectionMicros = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(
                 SchedulerClock::now() - selectionStart).count());
 
@@ -1360,10 +1444,16 @@ namespace
                 return;
 
             std::size_t activeIntents = 0;
+            std::size_t assistOnlyBots = 0;
+            std::size_t currentBots = 0;
             for (auto const& state : _states)
             {
                 if (state.second.intent.IsActive())
                     ++activeIntents;
+                if (state.second.experimentMode == LazyQuestExperimentMode::AssistOnly)
+                    ++assistOnlyBots;
+                else
+                    ++currentBots;
             }
 
             double const averageDiscoveryMicros = _metrics.selectorRuns
@@ -1371,11 +1461,13 @@ namespace
                 : 0.0;
 
             LOG_INFO("playerbots",
-                     "[LQ] scheduler: roster/registered/pending={}/{}/{}, intents={}, queues={}/{}, "
+                     "[LQ] scheduler: roster/registered/pending={}/{}/{}, modes control/assist/current={}/{}/{}, "
+                     "intents={}, queues={}/{}, "
                      "processed={}/{}, registrations={}/{}/{}, progress/repoints/preemptions={}/{}/{}, "
                      "exhausted/hard-stalls={}/{}, selector avg/max={:.0f}/{}us, "
                      "indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}",
                      sStrictAltbotMgr->GetRosterSize(), _states.size(), _registrationRetries.size(),
+                     _controlBots.size(), assistOnlyBots, currentBots,
                      activeIntents, _activeQueue.size(), _discoveryQueue.size(),
                      _metrics.activeProcessed, _metrics.discoveryProcessed,
                      _metrics.registrationsCompleted, _metrics.registrationRetries,
@@ -1400,6 +1492,7 @@ namespace
             }
 
             _states.clear();
+            _controlBots.clear();
             _activeQueue = {};
             _discoveryQueue = {};
             _registrationRetries.clear();
@@ -1412,6 +1505,7 @@ namespace
 
         LazyQuestingConfig _config;
         std::unordered_map<uint64, LazyBotState> _states;
+        std::unordered_set<uint64> _controlBots;
         ScheduleQueue _activeQueue;
         ScheduleQueue _discoveryQueue;
         std::unordered_map<uint64, RegistrationRetryState> _registrationRetries;
@@ -1480,11 +1574,13 @@ public:
         LazyQuestingConfig const config = ReadLazyQuestingConfig();
         LazyQuestingScheduler::Instance().Configure(config);
         LOG_INFO("server.loading",
-                 "mod-lazy-questing config: enabled={}, budget={}ms, active={}ms, discovery={}..{}ms, "
-                 "per-tick active/discovery={}/{}.",
-                 config.enabled, config.worldBudgetMs, config.activeCheckIntervalMs,
-                 config.discoveryIntervalMs, config.maxDiscoveryBackoffMs,
-                 config.maxActiveBotsPerTick, config.maxDiscoveryBotsPerTick);
+                  "mod-lazy-questing config: enabled={}, budget={}ms, active={}ms, discovery={}..{}ms, "
+                  "per-tick active/discovery={}/{}, experiment seed={}, control/assist/current={}/{}/{}%.",
+                  config.enabled, config.worldBudgetMs, config.activeCheckIntervalMs,
+                  config.discoveryIntervalMs, config.maxDiscoveryBackoffMs,
+                  config.maxActiveBotsPerTick, config.maxDiscoveryBotsPerTick, config.experimentSeed,
+                  config.experimentControlPercent, config.experimentAssistOnlyPercent,
+                  100 - config.experimentControlPercent - config.experimentAssistOnlyPercent);
     }
 
     void OnStartup() override

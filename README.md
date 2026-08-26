@@ -30,6 +30,17 @@ before applying a bounded quest cooldown. Objective points are selected by
 distance and existing visitors, which spreads a large cohort across available
 spawns instead of concentrating it at a random point.
 
+Strict Altbots can be assigned deterministically to three experiment modes:
+
+- `control`, which is never touched by Lazy Questing;
+- `assist-only`, which permits quest pickup and turn-in but no objective routing;
+- `current`, which retains the module's complete current behavior.
+
+The configured control and assist percentages use a stable hash of character
+GUID, race, class, and experiment seed. The unassigned remainder uses current
+behavior, so the default zero-percent experiment configuration is backward
+compatible.
+
 ## Requirements
 
 - AzerothCore
@@ -46,6 +57,8 @@ as bot counts grow:
 - scheduler work is limited to 2 milliseconds per world tick;
 - aggregate registration, progress, recovery, scheduler, and selector metrics
   are logged once per minute.
+- experiment assignments remain stable across restarts and are included in the
+  aggregate scheduler metrics.
 
 Quest completion, level changes, and map changes wake the affected bot without
 waiting for its polling interval. The module has no SQL or commands.
