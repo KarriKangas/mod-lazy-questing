@@ -19,3 +19,22 @@ LazyQuesting.MaxDiscoveryBotsPerTick = 4
 
 # Emit one aggregate scheduler health line at this interval. Per-bot lifecycle messages are debug-level.
 LazyQuesting.MetricsIntervalMs = 60000
+
+# Stable experiment assignment for strict Altbots. The assignment is derived from character GUID,
+# race, class, and the seed, and therefore remains stable across restarts. Control bots are never
+# touched by Lazy Questing. Assist-only bots may pick up and turn in quests but are never routed to
+# quest objectives. Any percentage left over keeps the current Lazy Questing behavior.
+#
+# For a control-versus-assist experiment, set both percentages to 50. Change the seed to create a new
+# assignment; keep it fixed throughout an experiment. ControlPercent + AssistOnlyPercent may not
+# exceed 100 (AssistOnlyPercent is clamped to the remaining percentage).
+LazyQuesting.Experiment.Seed = 1
+LazyQuesting.Experiment.ControlPercent = 0
+LazyQuesting.Experiment.AssistOnlyPercent = 0
+
+# Low-overhead measurement for every online strict Altbot, including the control cohort. Exact XP and
+# discrete gameplay events are captured from PlayerScript hooks. Activity and objective progress are
+# sampled, kept in bounded per-bot memory, and emitted as one aggregate line per experiment mode.
+LazyQuesting.FlightRecorder.Enable = 1
+LazyQuesting.FlightRecorder.SampleIntervalMs = 5000
+LazyQuesting.FlightRecorder.MetricsIntervalMs = 60000

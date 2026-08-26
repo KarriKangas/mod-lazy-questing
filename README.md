@@ -30,6 +30,26 @@ before applying a bounded quest cooldown. Objective points are selected by
 distance and existing visitors, which spreads a large cohort across available
 spawns instead of concentrating it at a random point.
 
+Strict Altbots can be assigned deterministically to three experiment modes:
+
+- `control`, which is never touched by Lazy Questing;
+- `assist-only`, which permits quest pickup and turn-in but no objective routing;
+- `current`, which retains the module's complete current behavior.
+
+The configured control and assist percentages use a stable hash of character
+GUID, race, class, and experiment seed. The unassigned remainder uses current
+behavior, so the default zero-percent experiment configuration is backward
+compatible.
+
+An optional flight recorder observes all online strict Altbots, including the
+control cohort. Exact XP events are split into kill, quest, exploration, and
+other sources. Bounded per-bot counters also retain kills, deaths, loot events,
+quest pickups, objective deltas, completions, turn-ins, level-ups, and the
+current Lazy Questing intent. A five-second sample attributes time to travel,
+combat, looting, interaction, service, death/corpse-running, or idle activity.
+Once per minute these measurements are emitted as one aggregate log line per
+experiment mode; no per-event or per-bot log stream is produced.
+
 ## Requirements
 
 - AzerothCore
@@ -46,6 +66,10 @@ as bot counts grow:
 - scheduler work is limited to 2 milliseconds per world tick;
 - aggregate registration, progress, recovery, scheduler, and selector metrics
   are logged once per minute.
+- experiment assignments remain stable across restarts and are included in the
+  aggregate scheduler metrics.
+- flight-recorder activity is sampled every 5 seconds and its counters are
+  aggregated once per minute by experiment mode.
 
 Quest completion, level changes, and map changes wake the affected bot without
 waiting for its polling interval. The module has no SQL or commands.
