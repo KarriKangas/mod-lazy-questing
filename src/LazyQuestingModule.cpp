@@ -12,6 +12,7 @@
 #include "TravelMgr.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -71,6 +72,9 @@ namespace
         uint32 experimentSeed = 1;
         uint32 experimentControlPercent = 0;
         uint32 experimentAssistOnlyPercent = 0;
+        bool flightRecorderEnabled = true;
+        uint32 flightRecorderSampleIntervalMs = 5 * IN_MILLISECONDS;
+        uint32 flightRecorderMetricsIntervalMs = MINUTE * IN_MILLISECONDS;
     };
 
     uint32 ClampConfig(uint32 value, uint32 minimum, uint32 maximum)
@@ -103,6 +107,11 @@ namespace
         config.experimentAssistOnlyPercent = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.AssistOnlyPercent", 0), 0,
             100 - config.experimentControlPercent);
+        config.flightRecorderEnabled = sConfigMgr->GetOption<bool>("LazyQuesting.FlightRecorder.Enable", true);
+        config.flightRecorderSampleIntervalMs = ClampConfig(
+            sConfigMgr->GetOption<uint32>("LazyQuesting.FlightRecorder.SampleIntervalMs", 5000), 1000, 60000);
+        config.flightRecorderMetricsIntervalMs = ClampConfig(
+            sConfigMgr->GetOption<uint32>("LazyQuesting.FlightRecorder.MetricsIntervalMs", 60000), 10000, 3600000);
         return config;
     }
 
@@ -828,6 +837,103 @@ namespace
         uint64 hardStalls = 0;
     };
 
+    enum class RecordedActivity : uint8
+    {
+        Travelling,
+        Fighting,
+        Looting,
+        Interacting,
+        Servicing,
+        Dead,
+        Idle,
+        Count,
+    };
+
+    constexpr std::size_t RECORDED_ACTIVITY_COUNT = static_cast<std::size_t>(RecordedActivity::Count);
+    constexpr std::size_t EXPERIMENT_MODE_COUNT = 3;
+
+    std::size_t ExperimentModeIndex(LazyQuestExperimentMode mode)
+    {
+        return static_cast<std::size_t>(mode);
+    }
+
+    struct FlightRecorderCounters
+    {
+        std::array<uint64, RECORDED_ACTIVITY_COUNT> activityMs{};
+        uint64 xpKill = 0;
+        uint64 xpQuest = 0;
+        uint64 xpExplore = 0;
+        uint64 xpOther = 0;
+        uint64 kills = 0;
+        uint64 deaths = 0;
+        uint64 lootEvents = 0;
+        uint64 questPickups = 0;
+        uint64 objectiveDeltas = 0;
+        uint64 questCompletions = 0;
+        uint64 questTurnIns = 0;
+        uint64 levelUps = 0;
+
+        void Add(FlightRecorderCounters const& other)
+        {
+            for (std::size_t i = 0; i < activityMs.size(); ++i)
+                activityMs[i] += other.activityMs[i];
+
+            xpKill += other.xpKill;
+            xpQuest += other.xpQuest;
+            xpExplore += other.xpExplore;
+            xpOther += other.xpOther;
+            kills += other.kills;
+            deaths += other.deaths;
+            lootEvents += other.lootEvents;
+            questPickups += other.questPickups;
+            objectiveDeltas += other.objectiveDeltas;
+            questCompletions += other.questCompletions;
+            questTurnIns += other.questTurnIns;
+            levelUps += other.levelUps;
+        }
+
+        uint64 TotalXp() const { return xpKill + xpQuest + xpExplore + xpOther; }
+
+        uint64 TotalActivityMs() const
+        {
+            uint64 total = 0;
+            for (uint64 duration : activityMs)
+                total += duration;
+            return total;
+        }
+
+        bool HasData() const
+        {
+            return TotalActivityMs() || TotalXp() || kills || deaths || lootEvents || questPickups ||
+                objectiveDeltas || questCompletions || questTurnIns || levelUps;
+        }
+    };
+
+    struct FlightRecorderPending
+    {
+        FlightRecorderCounters counters;
+        std::unordered_map<uint32, uint32> completedQuestCounts;
+        LazyQuestExperimentMode mode = LazyQuestExperimentMode::Current;
+        SchedulerTime registeredAt = SchedulerTime::min();
+        SchedulerTime removedAt = SchedulerTime::min();
+        bool registered = false;
+        bool removed = false;
+    };
+
+    struct FlightRecorderBotState
+    {
+        FlightRecorderCounters counters;
+        std::unordered_map<uint32, uint32> questProgress;
+        std::unordered_set<uint32> completedQuests;
+        LazyQuestExperimentMode mode = LazyQuestExperimentMode::Current;
+        RecordedActivity lastActivity = RecordedActivity::Idle;
+        SchedulerTime lastObservedAt = SchedulerTime::min();
+        uint32 currentIntentQuestId = 0;
+        LazyQuestIntentType currentIntentType = LazyQuestIntentType::DoQuest;
+        bool observed = false;
+        bool retired = false;
+    };
+
     class LazyQuestingScheduler
     {
     public:
@@ -916,6 +1022,17 @@ namespace
         void Shutdown()
         {
             ClearStates();
+        }
+
+        bool GetIntentSnapshot(uint64 guid, uint32& questId, LazyQuestIntentType& type) const
+        {
+            auto const state = _states.find(guid);
+            if (state == _states.end() || !state->second.intent.IsActive())
+                return false;
+
+            questId = state->second.intent.questId;
+            type = state->second.intent.type;
+            return true;
         }
 
     private:
@@ -1521,6 +1638,512 @@ namespace
         bool _clearRequested = false;
         bool _rosterReconcileRequested = false;
     };
+
+    class LazyQuestFlightRecorder
+    {
+    public:
+        static LazyQuestFlightRecorder& Instance()
+        {
+            static LazyQuestFlightRecorder recorder;
+            return recorder;
+        }
+
+        void Configure(LazyQuestingConfig const& config)
+        {
+            bool const wasEnabled = _config.flightRecorderEnabled;
+            _config = config;
+
+            if (wasEnabled && !_config.flightRecorderEnabled)
+                _clearRequested = true;
+            else if (!wasEnabled && _config.flightRecorderEnabled)
+                Start();
+        }
+
+        void Start()
+        {
+            SchedulerTime const now = SchedulerClock::now();
+            _nextSampleAt = now;
+            _nextMetricsAt = now + std::chrono::milliseconds(_config.flightRecorderMetricsIntervalMs);
+            _nextReconcileAt = now;
+        }
+
+        void RecordLogin(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending)
+            {
+                pending.registered = true;
+                pending.registeredAt = SchedulerClock::now();
+                pending.removed = false;
+            });
+        }
+
+        void RecordLogout(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending)
+            {
+                pending.removed = true;
+                pending.removedAt = SchedulerClock::now();
+            });
+        }
+
+        void RecordXp(Player* player, uint32 amount, uint8 source)
+        {
+            MutatePending(player, [amount, source](FlightRecorderPending& pending)
+            {
+                switch (source)
+                {
+                    case XPSOURCE_KILL:
+                        pending.counters.xpKill += amount;
+                        break;
+                    case XPSOURCE_QUEST:
+                    case XPSOURCE_QUEST_DF:
+                        pending.counters.xpQuest += amount;
+                        break;
+                    case XPSOURCE_EXPLORE:
+                        pending.counters.xpExplore += amount;
+                        break;
+                    default:
+                        pending.counters.xpOther += amount;
+                        break;
+                }
+            });
+        }
+
+        void RecordKill(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.kills; });
+        }
+
+        void RecordDeath(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.deaths; });
+        }
+
+        void RecordLoot(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.lootEvents; });
+        }
+
+        void RecordQuestPickup(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.questPickups; });
+        }
+
+        void RecordQuestTurnIn(Player* player, uint32 questId)
+        {
+            MutatePending(player, [questId](FlightRecorderPending& pending)
+            {
+                ++pending.counters.questTurnIns;
+                if (questId)
+                    ++pending.completedQuestCounts[questId];
+            });
+        }
+
+        void RecordLevelUp(Player* player)
+        {
+            MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.levelUps; });
+        }
+
+        void Update()
+        {
+            SchedulerTime const now = SchedulerClock::now();
+            DrainPending(now);
+
+            if (_clearRequested)
+            {
+                SampleBots(now);
+                LogMetrics(now, true);
+                Clear();
+                _clearRequested = false;
+            }
+
+            if (!_config.flightRecorderEnabled)
+                return;
+
+            if (now >= _nextReconcileAt)
+            {
+                Reconcile(now);
+                _nextReconcileAt = now + std::chrono::milliseconds(ROSTER_RECONCILE_INTERVAL_MS);
+            }
+
+            if (now >= _nextSampleAt)
+            {
+                SampleBots(now);
+                _nextSampleAt = now + std::chrono::milliseconds(_config.flightRecorderSampleIntervalMs);
+            }
+
+            LogMetrics(now, false);
+        }
+
+        void Shutdown()
+        {
+            SchedulerTime const now = SchedulerClock::now();
+            DrainPending(now);
+            SampleBots(now);
+            LogMetrics(now, true);
+            Clear();
+        }
+
+    private:
+        LazyQuestFlightRecorder() = default;
+
+        template <typename Callback>
+        void MutatePending(Player* player, Callback callback)
+        {
+            if (!_config.flightRecorderEnabled || !IsLazyQuestingBot(player))
+                return;
+
+            uint64 const guid = player->GetGUID().GetRawValue();
+            LazyQuestExperimentMode const mode = GetExperimentMode(player, _config);
+            std::lock_guard<std::mutex> lock(_pendingMutex);
+            FlightRecorderPending& pending = _pending[guid];
+            pending.mode = mode;
+            callback(pending);
+        }
+
+        static std::size_t ActivityIndex(RecordedActivity activity)
+        {
+            return static_cast<std::size_t>(activity);
+        }
+
+        uint32 GetQuestProgressValue(QuestStatusData const& status) const
+        {
+            uint32 progress = status.PlayerCount + (status.Explored ? 1 : 0);
+            for (uint16 count : status.ItemCount)
+                progress += count;
+            for (uint16 count : status.CreatureOrGOCount)
+                progress += count;
+            return progress;
+        }
+
+        RecordedActivity ClassifyActivity(Player* player) const
+        {
+            if (!player->IsAlive())
+                return RecordedActivity::Dead;
+            if (player->IsInCombat())
+                return RecordedActivity::Fighting;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+            TravelTarget* travelTarget = nullptr;
+            TravelDestination* destination = nullptr;
+            NewRpgStatus rpgStatus = RPG_IDLE;
+
+            if (botAI)
+            {
+                AiObjectContext* context = botAI->GetAiObjectContext();
+                if (context->GetValue<bool>("has available loot")->Get())
+                    return RecordedActivity::Looting;
+
+                travelTarget = context->GetValue<TravelTarget*>("travel target")->Get();
+                destination = travelTarget ? travelTarget->getDestination() : nullptr;
+                rpgStatus = botAI->rpgInfo.GetStatus();
+
+                if (HasEssentialRpgNeed(botAI) &&
+                    (dynamic_cast<RpgTravelDestination*>(destination) || rpgStatus == RPG_WANDER_NPC))
+                    return RecordedActivity::Servicing;
+
+                if ((travelTarget && travelTarget->getStatus() == TRAVEL_STATUS_WORK &&
+                     dynamic_cast<QuestRelationTravelDestination*>(destination)) ||
+                    rpgStatus == RPG_WANDER_NPC)
+                    return RecordedActivity::Interacting;
+            }
+
+            if (player->IsInFlight() || player->IsBeingTeleported() || player->HasUnitState(UNIT_STATE_MOVING) ||
+                (travelTarget && (travelTarget->getStatus() == TRAVEL_STATUS_PREPARE ||
+                                  travelTarget->getStatus() == TRAVEL_STATUS_TRAVEL)))
+                return RecordedActivity::Travelling;
+
+            return RecordedActivity::Idle;
+        }
+
+        void InitializeSnapshots(Player* player, FlightRecorderBotState& state, SchedulerTime now)
+        {
+            state.questProgress.clear();
+            state.completedQuests.clear();
+            for (auto const& quest : player->getQuestStatusMap())
+            {
+                if (quest.second.Status == QUEST_STATUS_INCOMPLETE || quest.second.Status == QUEST_STATUS_COMPLETE)
+                {
+                    state.questProgress[quest.first] = GetQuestProgressValue(quest.second);
+                    if (quest.second.Status == QUEST_STATUS_COMPLETE)
+                        state.completedQuests.insert(quest.first);
+                }
+            }
+
+            state.lastActivity = ClassifyActivity(player);
+            state.lastObservedAt = now;
+            state.observed = true;
+            state.retired = false;
+            UpdateIntentSnapshot(player, state);
+        }
+
+        void UpdateIntentSnapshot(Player* player, FlightRecorderBotState& state)
+        {
+            uint32 questId = 0;
+            LazyQuestIntentType type = LazyQuestIntentType::DoQuest;
+            if (LazyQuestingScheduler::Instance().GetIntentSnapshot(player->GetGUID().GetRawValue(), questId, type))
+            {
+                state.currentIntentQuestId = questId;
+                state.currentIntentType = type;
+            }
+            else
+            {
+                state.currentIntentQuestId = 0;
+                state.currentIntentType = LazyQuestIntentType::DoQuest;
+            }
+        }
+
+        void AccrueActivity(FlightRecorderBotState& state, SchedulerTime until)
+        {
+            if (!state.observed || until <= state.lastObservedAt)
+                return;
+
+            uint64 const elapsedMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                until - state.lastObservedAt).count());
+            state.counters.activityMs[ActivityIndex(state.lastActivity)] += elapsedMs;
+            state.lastObservedAt = until;
+        }
+
+        void ObserveQuestProgress(Player* player, FlightRecorderBotState& state)
+        {
+            std::unordered_set<uint32> activeQuests;
+            activeQuests.reserve(player->getQuestStatusMap().size());
+
+            for (auto const& quest : player->getQuestStatusMap())
+            {
+                if (quest.second.Status != QUEST_STATUS_INCOMPLETE && quest.second.Status != QUEST_STATUS_COMPLETE)
+                    continue;
+
+                activeQuests.insert(quest.first);
+                uint32 const progress = GetQuestProgressValue(quest.second);
+                auto const previous = state.questProgress.find(quest.first);
+                if (previous == state.questProgress.end())
+                {
+                    state.questProgress.emplace(quest.first, progress);
+                    state.counters.objectiveDeltas += progress;
+                }
+                else
+                {
+                    if (progress > previous->second)
+                        state.counters.objectiveDeltas += progress - previous->second;
+                    previous->second = progress;
+                }
+
+                if (quest.second.Status == QUEST_STATUS_COMPLETE)
+                {
+                    if (state.completedQuests.insert(quest.first).second)
+                        ++state.counters.questCompletions;
+                }
+                else
+                    state.completedQuests.erase(quest.first);
+            }
+
+            for (auto itr = state.questProgress.begin(); itr != state.questProgress.end();)
+            {
+                if (!activeQuests.count(itr->first))
+                {
+                    state.completedQuests.erase(itr->first);
+                    itr = state.questProgress.erase(itr);
+                }
+                else
+                    ++itr;
+            }
+        }
+
+        void CarryCounters(uint64 /*guid*/, FlightRecorderBotState& state)
+        {
+            if (!state.counters.HasData())
+                return;
+
+            std::size_t const modeIndex = ExperimentModeIndex(state.mode);
+            _carried[modeIndex].Add(state.counters);
+            ++_carriedBots[modeIndex];
+            state.counters = {};
+        }
+
+        FlightRecorderBotState& EnsureState(uint64 guid, Player* player, LazyQuestExperimentMode mode,
+                                            SchedulerTime now)
+        {
+            auto const inserted = _states.try_emplace(guid);
+            FlightRecorderBotState& state = inserted.first->second;
+
+            if (!inserted.second && state.mode != mode)
+                CarryCounters(guid, state);
+            state.mode = mode;
+
+            if (player && (!state.observed || state.retired))
+                InitializeSnapshots(player, state, now);
+            return state;
+        }
+
+        void DrainPending(SchedulerTime now)
+        {
+            std::unordered_map<uint64, FlightRecorderPending> pending;
+            {
+                std::lock_guard<std::mutex> lock(_pendingMutex);
+                pending.swap(_pending);
+            }
+
+            for (auto& event : pending)
+            {
+                Player* player = ObjectAccessor::FindPlayer(ObjectGuid(event.first));
+                if (player && !IsLazyQuestingBot(player))
+                    player = nullptr;
+
+                FlightRecorderBotState& state = EnsureState(event.first, player, event.second.mode, now);
+                state.counters.Add(event.second.counters);
+
+                if (event.second.registered && player)
+                    InitializeSnapshots(player, state, event.second.registeredAt);
+
+                for (auto const& completion : event.second.completedQuestCounts)
+                {
+                    uint32 const alreadyObserved = state.completedQuests.count(completion.first) ? 1 : 0;
+                    state.counters.questCompletions += completion.second - alreadyObserved;
+                    state.completedQuests.insert(completion.first);
+                }
+
+                if (event.second.removed)
+                {
+                    AccrueActivity(state, event.second.removedAt);
+                    state.retired = true;
+                    state.currentIntentQuestId = 0;
+                }
+            }
+        }
+
+        void Reconcile(SchedulerTime now)
+        {
+            for (uint32 lowGuid : sStrictAltbotMgr->GetRoster())
+            {
+                ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(lowGuid);
+                Player* player = ObjectAccessor::FindPlayer(guid);
+                if (!player)
+                    continue;
+
+                EnsureState(guid.GetRawValue(), player, GetExperimentMode(player, _config), now);
+            }
+        }
+
+        void SampleBots(SchedulerTime now)
+        {
+            for (auto& entry : _states)
+            {
+                FlightRecorderBotState& state = entry.second;
+                if (state.retired)
+                    continue;
+
+                Player* player = ObjectAccessor::FindPlayer(ObjectGuid(entry.first));
+                if (!player || !IsLazyQuestingBot(player) || !player->IsInWorld())
+                {
+                    AccrueActivity(state, now);
+                    state.retired = true;
+                    state.currentIntentQuestId = 0;
+                    continue;
+                }
+
+                LazyQuestExperimentMode const mode = GetExperimentMode(player, _config);
+                if (state.mode != mode)
+                {
+                    CarryCounters(entry.first, state);
+                    state.mode = mode;
+                }
+
+                AccrueActivity(state, now);
+                ObserveQuestProgress(player, state);
+                UpdateIntentSnapshot(player, state);
+                state.lastActivity = ClassifyActivity(player);
+            }
+        }
+
+        void LogMetrics(SchedulerTime now, bool force)
+        {
+            if (!force && now < _nextMetricsAt)
+                return;
+
+            std::array<FlightRecorderCounters, EXPERIMENT_MODE_COUNT> totals = _carried;
+            std::array<uint64, EXPERIMENT_MODE_COUNT> botCounts = _carriedBots;
+            std::array<uint64, EXPERIMENT_MODE_COUNT> intentCounts{};
+
+            for (auto const& entry : _states)
+            {
+                std::size_t const modeIndex = ExperimentModeIndex(entry.second.mode);
+                totals[modeIndex].Add(entry.second.counters);
+                ++botCounts[modeIndex];
+                if (entry.second.currentIntentQuestId)
+                    ++intentCounts[modeIndex];
+            }
+
+            std::array<LazyQuestExperimentMode, EXPERIMENT_MODE_COUNT> const modes = {
+                LazyQuestExperimentMode::Control,
+                LazyQuestExperimentMode::AssistOnly,
+                LazyQuestExperimentMode::Current,
+            };
+
+            for (LazyQuestExperimentMode mode : modes)
+            {
+                std::size_t const modeIndex = ExperimentModeIndex(mode);
+                FlightRecorderCounters const& counters = totals[modeIndex];
+                if (!botCounts[modeIndex] && !counters.HasData())
+                    continue;
+
+                LOG_INFO("playerbots",
+                         "[LQ][flight] mode={} bots={} xp total/kill/quest/explore/other={}/{}/{}/{}/{}, "
+                         "activity-s travel/fight/loot/interact/service/dead/idle={}/{}/{}/{}/{}/{}/{}, "
+                         "events kills/deaths/loot/pickups/objective-deltas/completions/turn-ins/levels="
+                         "{}/{}/{}/{}/{}/{}/{}/{}, intents={}",
+                         ExperimentModeName(mode), botCounts[modeIndex], counters.TotalXp(), counters.xpKill,
+                         counters.xpQuest, counters.xpExplore, counters.xpOther,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Travelling)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Fighting)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Looting)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Interacting)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Servicing)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Dead)] / IN_MILLISECONDS,
+                         counters.activityMs[ActivityIndex(RecordedActivity::Idle)] / IN_MILLISECONDS,
+                         counters.kills, counters.deaths, counters.lootEvents, counters.questPickups,
+                         counters.objectiveDeltas, counters.questCompletions, counters.questTurnIns,
+                         counters.levelUps, intentCounts[modeIndex]);
+            }
+
+            _carried = {};
+            _carriedBots = {};
+            for (auto itr = _states.begin(); itr != _states.end();)
+            {
+                if (itr->second.retired)
+                {
+                    itr = _states.erase(itr);
+                    continue;
+                }
+
+                itr->second.counters = {};
+                ++itr;
+            }
+            _nextMetricsAt = now + std::chrono::milliseconds(_config.flightRecorderMetricsIntervalMs);
+        }
+
+        void Clear()
+        {
+            _states.clear();
+            _carried = {};
+            _carriedBots = {};
+            {
+                std::lock_guard<std::mutex> lock(_pendingMutex);
+                _pending.clear();
+            }
+        }
+
+        LazyQuestingConfig _config;
+        std::unordered_map<uint64, FlightRecorderBotState> _states;
+        std::array<FlightRecorderCounters, EXPERIMENT_MODE_COUNT> _carried{};
+        std::array<uint64, EXPERIMENT_MODE_COUNT> _carriedBots{};
+        std::mutex _pendingMutex;
+        std::unordered_map<uint64, FlightRecorderPending> _pending;
+        SchedulerTime _nextSampleAt = SchedulerTime::max();
+        SchedulerTime _nextMetricsAt = SchedulerTime::max();
+        SchedulerTime _nextReconcileAt = SchedulerTime::max();
+        bool _clearRequested = false;
+    };
 }
 
 class LazyQuestingPlayerScript final : public PlayerScript
@@ -1528,34 +2151,72 @@ class LazyQuestingPlayerScript final : public PlayerScript
 public:
     LazyQuestingPlayerScript()
         : PlayerScript("LazyQuestingPlayerScript",
-                       { PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_LEVEL_CHANGED,
-                         PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_BEFORE_LOGOUT, PLAYERHOOK_ON_MAP_CHANGED })
+                       { PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
+                         PLAYERHOOK_ON_CREATURE_KILL, PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
+                         PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_GIVE_EXP, PLAYERHOOK_ON_LOGIN,
+                         PLAYERHOOK_ON_BEFORE_LOGOUT, PLAYERHOOK_ON_MAP_CHANGED,
+                         PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, PLAYERHOOK_ON_AFTER_CREATURE_LOOT })
     {
     }
 
     void OnPlayerLogin(Player* player) override
     {
+        LazyQuestFlightRecorder::Instance().RecordLogin(player);
         LazyQuestingScheduler::Instance().QueueEvent(PendingBotEventType::Register, player);
     }
 
     void OnPlayerBeforeLogout(Player* player) override
     {
+        LazyQuestFlightRecorder::Instance().RecordLogout(player);
         LazyQuestingScheduler::Instance().QueueEvent(PendingBotEventType::Remove, player);
     }
 
-    void OnPlayerCompleteQuest(Player* player, Quest const* /*quest*/) override
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
     {
+        LazyQuestFlightRecorder::Instance().RecordQuestTurnIn(player, quest ? quest->GetQuestId() : 0);
         LazyQuestingScheduler::Instance().QueueEvent(PendingBotEventType::Wake, player);
     }
 
-    void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
+    void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
     {
+        if (player->GetLevel() > oldLevel)
+            LazyQuestFlightRecorder::Instance().RecordLevelUp(player);
         LazyQuestingScheduler::Instance().QueueEvent(PendingBotEventType::Wake, player);
     }
 
     void OnPlayerMapChanged(Player* player) override
     {
         LazyQuestingScheduler::Instance().QueueEvent(PendingBotEventType::Wake, player);
+    }
+
+    void OnPlayerGiveXP(Player* player, uint32& amount, Unit* /*victim*/, uint8 xpSource) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordXp(player, amount, xpSource);
+    }
+
+    void OnPlayerCreatureKill(Player* player, Creature* /*killed*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordKill(player);
+    }
+
+    void OnPlayerCreatureKilledByPet(Player* player, Creature* /*killed*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordKill(player);
+    }
+
+    void OnPlayerJustDied(Player* player) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordDeath(player);
+    }
+
+    void OnPlayerQuestAccept(Player* player, Quest const* /*quest*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordQuestPickup(player);
+    }
+
+    void OnPlayerAfterCreatureLoot(Player* player) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordLoot(player);
     }
 };
 
@@ -1573,14 +2234,18 @@ public:
     {
         LazyQuestingConfig const config = ReadLazyQuestingConfig();
         LazyQuestingScheduler::Instance().Configure(config);
+        LazyQuestFlightRecorder::Instance().Configure(config);
         LOG_INFO("server.loading",
                   "mod-lazy-questing config: enabled={}, budget={}ms, active={}ms, discovery={}..{}ms, "
-                  "per-tick active/discovery={}/{}, experiment seed={}, control/assist/current={}/{}/{}%.",
+                  "per-tick active/discovery={}/{}, experiment seed={}, control/assist/current={}/{}/{}%, "
+                  "flight-recorder={} sample/metrics={}/{}ms.",
                   config.enabled, config.worldBudgetMs, config.activeCheckIntervalMs,
                   config.discoveryIntervalMs, config.maxDiscoveryBackoffMs,
                   config.maxActiveBotsPerTick, config.maxDiscoveryBotsPerTick, config.experimentSeed,
                   config.experimentControlPercent, config.experimentAssistOnlyPercent,
-                  100 - config.experimentControlPercent - config.experimentAssistOnlyPercent);
+                  100 - config.experimentControlPercent - config.experimentAssistOnlyPercent,
+                  config.flightRecorderEnabled, config.flightRecorderSampleIntervalMs,
+                  config.flightRecorderMetricsIntervalMs);
     }
 
     void OnStartup() override
@@ -1592,16 +2257,19 @@ public:
                      stats.points, stats.cells);
         }
         LazyQuestingScheduler::Instance().Start();
+        LazyQuestFlightRecorder::Instance().Start();
         LOG_INFO("server.loading", "mod-lazy-questing loaded.");
     }
 
     void OnUpdate(uint32 /*diff*/) override
     {
         LazyQuestingScheduler::Instance().Update();
+        LazyQuestFlightRecorder::Instance().Update();
     }
 
     void OnShutdown() override
     {
+        LazyQuestFlightRecorder::Instance().Shutdown();
         LazyQuestingScheduler::Instance().Shutdown();
     }
 };
