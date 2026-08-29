@@ -1,5 +1,6 @@
 #include "Config.h"
 #include "Event.h"
+#include "Item.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -18,6 +19,7 @@
 #include <deque>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -58,6 +60,11 @@ namespace
     constexpr uint8 MAX_FAILED_LEGS_PER_INTENT = 3;
     constexpr float MOVEMENT_PROGRESS_YARDS = 5.0f;
     constexpr float APPROACH_PROGRESS_YARDS = 10.0f;
+    constexpr float CONSERVATIVE_TURN_IN_DISTANCE = 250.0f;
+    constexpr float CONSERVATIVE_PICKUP_DISTANCE = 200.0f;
+    constexpr uint32 CONSERVATIVE_INTENT_LEASE_MS = MINUTE * IN_MILLISECONDS;
+    constexpr uint32 CONSERVATIVE_NO_PROGRESS_MS = 30 * IN_MILLISECONDS;
+    constexpr uint32 CONSERVATIVE_QUEST_COOLDOWN_MS = 2 * MINUTE * IN_MILLISECONDS;
 
     struct LazyQuestingConfig
     {
@@ -69,6 +76,7 @@ namespace
         uint32 maxActiveBotsPerTick = 64;
         uint32 maxDiscoveryBotsPerTick = 4;
         uint32 metricsIntervalMs = MINUTE * IN_MILLISECONDS;
+        std::string experimentRunId = "unassigned";
         uint32 experimentSeed = 1;
         uint32 experimentControlPercent = 0;
         uint32 experimentAssistOnlyPercent = 0;
@@ -101,6 +109,8 @@ namespace
             sConfigMgr->GetOption<uint32>("LazyQuesting.MaxDiscoveryBotsPerTick", 4), 1, 100);
         config.metricsIntervalMs = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.MetricsIntervalMs", 60000), 10000, 3600000);
+        config.experimentRunId = sConfigMgr->GetOption<std::string>(
+            "LazyQuesting.Experiment.RunId", "unassigned");
         config.experimentSeed = sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.Seed", 1);
         config.experimentControlPercent = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.ControlPercent", 0), 0, 100);
@@ -175,6 +185,27 @@ namespace
         }
     }
 
+    constexpr std::size_t INTENT_TYPE_COUNT = 3;
+
+    std::size_t IntentTypeIndex(LazyQuestIntentType type)
+    {
+        return static_cast<std::size_t>(type);
+    }
+
+    enum class PreviousTargetType : uint8
+    {
+        None,
+        Null,
+        Grind,
+        Explore,
+        Rpg,
+        Quest,
+        Other,
+        Count,
+    };
+
+    constexpr std::size_t PREVIOUS_TARGET_TYPE_COUNT = static_cast<std::size_t>(PreviousTargetType::Count);
+
     struct LazyQuestIntent
     {
         uint32 questId = 0;
@@ -186,6 +217,9 @@ namespace
         uint32 noApproachMs = 0;
         uint32 noWorkProgressMs = 0;
         uint32 noQuestProgressMs = 0;
+        float initialDistance = 0.0f;
+        float maxDistance = 2500.0f;
+        PreviousTargetType previousTargetType = PreviousTargetType::None;
         uint8 interactionFailures = 0;
         uint8 legFailures = 0;
         uint64 progressFingerprint = 0;
@@ -212,6 +246,9 @@ namespace
             noApproachMs = 0;
             noWorkProgressMs = 0;
             noQuestProgressMs = 0;
+            initialDistance = 0.0f;
+            maxDistance = 2500.0f;
+            previousTargetType = PreviousTargetType::None;
             interactionFailures = 0;
             legFailures = 0;
             progressFingerprint = 0;
@@ -246,11 +283,23 @@ namespace
         bool removedNewRpgStrategy = false;
     };
 
-    bool IsLowValueTarget(TravelDestination* destination)
+    PreviousTargetType ClassifyPreviousTarget(TravelTarget* target)
     {
-        return dynamic_cast<NullTravelDestination*>(destination) ||
-               dynamic_cast<GrindTravelDestination*>(destination) ||
-               dynamic_cast<ExploreTravelDestination*>(destination);
+        if (!target || !target->getDestination())
+            return PreviousTargetType::None;
+
+        TravelDestination* destination = target->getDestination();
+        if (dynamic_cast<NullTravelDestination*>(destination))
+            return PreviousTargetType::Null;
+        if (dynamic_cast<GrindTravelDestination*>(destination))
+            return PreviousTargetType::Grind;
+        if (dynamic_cast<ExploreTravelDestination*>(destination))
+            return PreviousTargetType::Explore;
+        if (dynamic_cast<RpgTravelDestination*>(destination))
+            return PreviousTargetType::Rpg;
+        if (dynamic_cast<QuestTravelDestination*>(destination))
+            return PreviousTargetType::Quest;
+        return PreviousTargetType::Other;
     }
 
     bool IsUsableTarget(Player* bot, TravelTarget* target)
@@ -288,26 +337,44 @@ namespace
         return needsVendor || needsRepair;
     }
 
+    bool HasAvailableLoot(PlayerbotAI* botAI)
+    {
+        AiObjectContext* context = botAI->GetAiObjectContext();
+        Value<bool>* value = context->GetValue<bool>("has available loot");
+        return value && value->Get();
+    }
+
+    bool HasProtectedRpgActivity(PlayerbotAI* botAI)
+    {
+        return botAI->rpgInfo.GetStatus() != RPG_IDLE;
+    }
+
+    bool HasProtectedActivity(PlayerbotAI* botAI)
+    {
+        return HasAvailableLoot(botAI) || HasEssentialRpgNeed(botAI) || HasProtectedRpgActivity(botAI);
+    }
+
     bool ShouldNudge(Player* bot, PlayerbotAI* botAI, TravelTarget* current)
     {
-        if (!current || current->isGroupCopy() || HasEssentialRpgNeed(botAI))
+        if (!current || current->isGroupCopy() || HasProtectedActivity(botAI))
             return false;
 
         TravelDestination* destination = current->getDestination();
 
         if (dynamic_cast<RpgTravelDestination*>(destination))
-        {
-            if (HasEssentialRpgNeed(botAI) || (current->isForced() && botAI->HasActivePlayerMaster()))
-                return false;
-
-            return true;
-        }
+            return false;
 
         if (current->isForced())
             return false;
 
-        if (!destination || IsLowValueTarget(destination))
+        if (!destination || dynamic_cast<NullTravelDestination*>(destination) ||
+            dynamic_cast<ExploreTravelDestination*>(destination))
             return true;
+
+        // Active grinding is the dominant early-level XP source in the measured control cohorts.
+        // Only replace a grind target after Playerbots itself considers it inactive or expired.
+        if (dynamic_cast<GrindTravelDestination*>(destination))
+            return !IsUsableTarget(bot, current);
 
         return !IsUsableTarget(bot, current);
     }
@@ -361,7 +428,8 @@ namespace
         bool const hadNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
 
         state.addedTravelStrategy = !hadTravel;
-        state.removedNewRpgStrategy = hadNewRpg;
+        state.removedNewRpgStrategy = hadNewRpg &&
+            state.experimentMode != LazyQuestExperimentMode::AssistOnly;
 
         if (state.addedTravelStrategy)
             botAI->ChangeStrategy("+travel", BOT_STATE_NON_COMBAT);
@@ -416,7 +484,7 @@ namespace
     }
 
     void AcquireIntent(Player* bot, PlayerbotAI* botAI, LazyBotState& state,
-                       LazyQuestCandidate const& candidate, uint32 nowMs)
+                       LazyQuestCandidate const& candidate, TravelTarget* previousTarget, uint32 nowMs)
     {
         state.intent.questId = candidate.questId;
         state.intent.type = candidate.type;
@@ -427,6 +495,13 @@ namespace
         state.intent.noApproachMs = 0;
         state.intent.noWorkProgressMs = 0;
         state.intent.noQuestProgressMs = 0;
+        state.intent.initialDistance = candidate.distance;
+        state.intent.maxDistance = state.experimentMode == LazyQuestExperimentMode::AssistOnly
+            ? (candidate.type == LazyQuestIntentType::TurnIn
+                ? CONSERVATIVE_TURN_IN_DISTANCE
+                : CONSERVATIVE_PICKUP_DISTANCE)
+            : 2500.0f;
+        state.intent.previousTargetType = ClassifyPreviousTarget(previousTarget);
         state.intent.interactionFailures = 0;
         state.intent.legFailures = 0;
         state.intent.progressFingerprint = GetQuestProgressFingerprint(bot, candidate.questId);
@@ -637,7 +712,7 @@ namespace
 
         LazyQuestCandidate candidate;
         if (!FindLazyQuestLeg(bot, intent.questId, intent.type, intent.destination,
-                              intent.failedPoints, candidate))
+                              intent.failedPoints, candidate, intent.maxDistance))
             return IntentRecoveryResult::Exhausted;
 
         AssignIntentLeg(bot, intent, current, candidate, nowMs);
@@ -837,6 +912,45 @@ namespace
         uint64 hardStalls = 0;
     };
 
+    enum class IntentEndReason : uint8
+    {
+        Success,
+        ProtectedActivity,
+        ConservativeLease,
+        Exhausted,
+        HardStall,
+        Cancelled,
+        Count,
+    };
+
+    constexpr std::size_t INTENT_END_REASON_COUNT = static_cast<std::size_t>(IntentEndReason::Count);
+
+    struct IntentMetrics
+    {
+        uint64 acquired = 0;
+        uint64 semanticProgress = 0;
+        uint64 repoints = 0;
+        uint64 preemptions = 0;
+        uint64 distanceYards = 0;
+        uint64 maxDistanceYards = 0;
+        uint64 durationMs = 0;
+        std::array<uint64, INTENT_END_REASON_COUNT> endings{};
+        std::array<uint64, PREVIOUS_TARGET_TYPE_COUNT> previousTargets{};
+
+        uint64 Ended() const
+        {
+            uint64 total = 0;
+            for (uint64 count : endings)
+                total += count;
+            return total;
+        }
+
+        bool HasData() const
+        {
+            return acquired || semanticProgress || repoints || preemptions || Ended();
+        }
+    };
+
     enum class RecordedActivity : uint8
     {
         Travelling,
@@ -872,6 +986,19 @@ namespace
         uint64 questCompletions = 0;
         uint64 questTurnIns = 0;
         uint64 levelUps = 0;
+        uint64 gearSamples = 0;
+        uint64 sampledLevels = 0;
+        uint64 sampledAverageItemLevels = 0;
+        uint64 sampledTotalItemLevels = 0;
+        uint64 sampledOccupiedSlots = 0;
+        uint64 sampledWeaponItemLevels = 0;
+        uint64 lootItems = 0;
+        uint64 lootGearItems = 0;
+        uint64 lootGearItemLevels = 0;
+        uint64 questRewardGearItems = 0;
+        uint64 questRewardGearItemLevels = 0;
+        uint64 equipEvents = 0;
+        uint64 equippedEventItemLevels = 0;
 
         void Add(FlightRecorderCounters const& other)
         {
@@ -890,6 +1017,19 @@ namespace
             questCompletions += other.questCompletions;
             questTurnIns += other.questTurnIns;
             levelUps += other.levelUps;
+            gearSamples += other.gearSamples;
+            sampledLevels += other.sampledLevels;
+            sampledAverageItemLevels += other.sampledAverageItemLevels;
+            sampledTotalItemLevels += other.sampledTotalItemLevels;
+            sampledOccupiedSlots += other.sampledOccupiedSlots;
+            sampledWeaponItemLevels += other.sampledWeaponItemLevels;
+            lootItems += other.lootItems;
+            lootGearItems += other.lootGearItems;
+            lootGearItemLevels += other.lootGearItemLevels;
+            questRewardGearItems += other.questRewardGearItems;
+            questRewardGearItemLevels += other.questRewardGearItemLevels;
+            equipEvents += other.equipEvents;
+            equippedEventItemLevels += other.equippedEventItemLevels;
         }
 
         uint64 TotalXp() const { return xpKill + xpQuest + xpExplore + xpOther; }
@@ -905,7 +1045,8 @@ namespace
         bool HasData() const
         {
             return TotalActivityMs() || TotalXp() || kills || deaths || lootEvents || questPickups ||
-                objectiveDeltas || questCompletions || questTurnIns || levelUps;
+                objectiveDeltas || questCompletions || questTurnIns || levelUps || gearSamples ||
+                lootItems || questRewardGearItems || equipEvents;
         }
     };
 
@@ -946,7 +1087,8 @@ namespace
         void Configure(LazyQuestingConfig const& config)
         {
             bool const wasEnabled = _config.enabled;
-            bool const experimentChanged = _config.experimentSeed != config.experimentSeed ||
+            bool const experimentChanged = _config.experimentRunId != config.experimentRunId ||
+                _config.experimentSeed != config.experimentSeed ||
                 _config.experimentControlPercent != config.experimentControlPercent ||
                 _config.experimentAssistOnlyPercent != config.experimentAssistOnlyPercent;
             _config = config;
@@ -1041,6 +1183,46 @@ namespace
             std::vector<ScheduledRegistration>, ScheduledRegistrationLater>;
 
         LazyQuestingScheduler() = default;
+
+        IntentMetrics& MetricsFor(LazyBotState const& state)
+        {
+            return _intentMetrics[ExperimentModeIndex(state.experimentMode)]
+                                 [IntentTypeIndex(state.intent.type)];
+        }
+
+        void RecordIntentAcquired(LazyBotState const& state)
+        {
+            IntentMetrics& metrics = MetricsFor(state);
+            ++metrics.acquired;
+            uint64 const distance = static_cast<uint64>(std::max(0.0f, state.intent.initialDistance));
+            metrics.distanceYards += distance;
+            metrics.maxDistanceYards = std::max(metrics.maxDistanceYards, distance);
+            ++metrics.previousTargets[static_cast<std::size_t>(state.intent.previousTargetType)];
+        }
+
+        void RecordIntentEnded(LazyBotState const& state, IntentEndReason reason, uint32 nowMs)
+        {
+            if (!state.intent.IsActive())
+                return;
+
+            IntentMetrics& metrics = MetricsFor(state);
+            ++metrics.endings[static_cast<std::size_t>(reason)];
+            metrics.durationMs += getMSTimeDiff(state.intent.startedAtMs, nowMs);
+        }
+
+        bool DidIntentSucceed(Player* player, LazyQuestIntent const& intent) const
+        {
+            switch (intent.type)
+            {
+                case LazyQuestIntentType::PickUp:
+                    return player->GetQuestStatus(intent.questId) != QUEST_STATUS_NONE;
+                case LazyQuestIntentType::TurnIn:
+                    return player->IsQuestRewarded(intent.questId);
+                case LazyQuestIntentType::DoQuest:
+                default:
+                    return player->GetQuestStatus(intent.questId) == QUEST_STATUS_COMPLETE;
+            }
+        }
 
         uint32 GetGuidJitter(uint64 guid, uint32 rangeMs) const
         {
@@ -1198,7 +1380,10 @@ namespace
             Player* player = ObjectAccessor::FindPlayer(ObjectGuid(guid));
             PlayerbotAI* botAI = player ? GET_PLAYERBOT_AI(player) : nullptr;
             if (player && botAI)
+            {
+                RecordIntentEnded(stateItr->second, IntentEndReason::Cancelled, getMSTime());
                 ReleaseIntent(player, botAI, stateItr->second, "bot logged out");
+            }
 
             _states.erase(stateItr);
         }
@@ -1374,6 +1559,9 @@ namespace
 
             if (!IsIntentQuestStateValid(player, state.intent))
             {
+                RecordIntentEnded(state, DidIntentSucceed(player, state.intent)
+                    ? IntentEndReason::Success
+                    : IntentEndReason::Cancelled, nowMs);
                 ReleaseIntent(player, botAI, state, "quest state changed");
                 Schedule(guid, state, ScheduleLane::Discovery,
                          now + std::chrono::milliseconds(POST_INTERACTION_RETRY_MS));
@@ -1382,24 +1570,46 @@ namespace
 
             bool const semanticProgress = ObserveQuestProgress(player, state.intent);
             if (semanticProgress)
+            {
                 ++_metrics.semanticProgress;
+                ++MetricsFor(state).semanticProgress;
+            }
 
             bool const externallyPreempted = current &&
                 (current->isGroupCopy() || (current->isForced() && !IsTravelTargetForIntent(current, state.intent)));
             if (IsTemporarilyUnavailable(player) || externallyPreempted)
             {
                 if (!state.intent.suspended)
+                {
                     ++_metrics.preemptions;
+                    ++MetricsFor(state).preemptions;
+                }
                 PauseIntentTracking(player, state.intent, nowMs);
                 Schedule(guid, state, ScheduleLane::Active,
                          now + std::chrono::milliseconds(TRANSIENT_RETRY_MS));
                 return;
             }
 
-            if (HasEssentialRpgNeed(botAI))
+            if (HasProtectedActivity(botAI))
             {
                 ++_metrics.preemptions;
-                ReleaseIntent(player, botAI, state, "essential RPG service");
+                ++MetricsFor(state).preemptions;
+                char const* reason = HasAvailableLoot(botAI)
+                    ? "loot available"
+                    : "protected RPG activity";
+                RecordIntentEnded(state, IntentEndReason::ProtectedActivity, nowMs);
+                ReleaseIntent(player, botAI, state, reason);
+                Schedule(guid, state, ScheduleLane::Discovery,
+                         now + std::chrono::milliseconds(_config.discoveryIntervalMs));
+                return;
+            }
+
+            if (state.experimentMode == LazyQuestExperimentMode::AssistOnly &&
+                getMSTimeDiff(state.intent.startedAtMs, nowMs) >= CONSERVATIVE_INTENT_LEASE_MS)
+            {
+                AddQuestCooldown(state, state.intent.questId, now, CONSERVATIVE_QUEST_COOLDOWN_MS);
+                RecordIntentEnded(state, IntentEndReason::ConservativeLease, nowMs);
+                ReleaseIntent(player, botAI, state, "conservative intent lease expired");
                 Schedule(guid, state, ScheduleLane::Discovery,
                          now + std::chrono::milliseconds(_config.discoveryIntervalMs));
                 return;
@@ -1413,6 +1623,7 @@ namespace
                 if (TryQuestInteraction(player, botAI, state.intent, current, nowMs))
                 {
                     ++_metrics.semanticProgress;
+                    ++MetricsFor(state).semanticProgress;
                     Schedule(guid, state, ScheduleLane::Active,
                              now + std::chrono::milliseconds(POST_INTERACTION_RETRY_MS));
                     return;
@@ -1438,6 +1649,18 @@ namespace
                         current->setForced(false);
 
                     UpdateIntentProgress(player, state.intent, current, nowMs, semanticProgress);
+
+                    if (state.experimentMode == LazyQuestExperimentMode::AssistOnly &&
+                        (state.intent.noMovementMs >= CONSERVATIVE_NO_PROGRESS_MS ||
+                         state.intent.noApproachMs >= CONSERVATIVE_NO_PROGRESS_MS))
+                    {
+                        AddQuestCooldown(state, state.intent.questId, now, CONSERVATIVE_QUEST_COOLDOWN_MS);
+                        RecordIntentEnded(state, IntentEndReason::ConservativeLease, nowMs);
+                        ReleaseIntent(player, botAI, state, "conservative intent stopped approaching");
+                        Schedule(guid, state, ScheduleLane::Discovery,
+                                 now + std::chrono::milliseconds(_config.discoveryIntervalMs));
+                        return;
+                    }
                 }
             }
 
@@ -1449,6 +1672,7 @@ namespace
                 if (recovery == IntentRecoveryResult::Repointed)
                 {
                     ++_metrics.repoints;
+                    ++MetricsFor(state).repoints;
                     Schedule(guid, state, ScheduleLane::Active,
                              now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
                     return;
@@ -1461,6 +1685,9 @@ namespace
                     ++_metrics.hardStalls;
                 else
                     ++_metrics.exhaustedIntents;
+
+                RecordIntentEnded(state,
+                    hardFailure ? IntentEndReason::HardStall : IntentEndReason::Exhausted, nowMs);
 
                 LOG_DEBUG("playerbots", "[LQ] {} deferred {} quest {} after {} failed leg(s)",
                           player->GetName(), IntentTypeName(state.intent.type), failedQuestId,
@@ -1528,8 +1755,11 @@ namespace
             LazyQuestSelectionStats selectionStats;
             SchedulerTime const selectionStart = SchedulerClock::now();
             bool const allowQuestWork = state.experimentMode == LazyQuestExperimentMode::Current;
+            bool const conservativeAssist = state.experimentMode == LazyQuestExperimentMode::AssistOnly;
             bool const found = FindLazyQuestCandidate(player, candidate, &coolingDown, &selectionStats,
-                                                      allowQuestWork);
+                                                      allowQuestWork,
+                                                      conservativeAssist ? CONSERVATIVE_TURN_IN_DISTANCE : 2500.0f,
+                                                      conservativeAssist ? CONSERVATIVE_PICKUP_DISTANCE : 0.0f);
             uint64 const selectionMicros = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(
                 SchedulerClock::now() - selectionStart).count());
 
@@ -1549,7 +1779,8 @@ namespace
                 return;
             }
 
-            AcquireIntent(player, botAI, state, candidate, getMSTime());
+            AcquireIntent(player, botAI, state, candidate, current, getMSTime());
+            RecordIntentAcquired(state);
             AssignIntentLeg(player, state.intent, current, candidate, getMSTime());
             Schedule(guid, state, ScheduleLane::Active,
                      now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
@@ -1578,12 +1809,13 @@ namespace
                 : 0.0;
 
             LOG_INFO("playerbots",
-                     "[LQ] scheduler: roster/registered/pending={}/{}/{}, modes control/assist/current={}/{}/{}, "
+                     "[LQ] scheduler run={}: roster/registered/pending={}/{}/{}, modes control/assist/current={}/{}/{}, "
                      "intents={}, queues={}/{}, "
                      "processed={}/{}, registrations={}/{}/{}, progress/repoints/preemptions={}/{}/{}, "
                      "exhausted/hard-stalls={}/{}, selector avg/max={:.0f}/{}us, "
                      "indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}",
-                     sStrictAltbotMgr->GetRosterSize(), _states.size(), _registrationRetries.size(),
+                     _config.experimentRunId, sStrictAltbotMgr->GetRosterSize(), _states.size(),
+                     _registrationRetries.size(),
                      _controlBots.size(), assistOnlyBots, currentBots,
                      activeIntents, _activeQueue.size(), _discoveryQueue.size(),
                      _metrics.activeProcessed, _metrics.discoveryProcessed,
@@ -1594,7 +1826,59 @@ namespace
                      _metrics.pickupDestinationsEvaluated, _metrics.candidatesFound,
                      _metrics.budgetLimitedTicks);
 
+            std::array<LazyQuestExperimentMode, EXPERIMENT_MODE_COUNT> const modes = {
+                LazyQuestExperimentMode::Control,
+                LazyQuestExperimentMode::AssistOnly,
+                LazyQuestExperimentMode::Current,
+            };
+            std::array<LazyQuestIntentType, INTENT_TYPE_COUNT> const types = {
+                LazyQuestIntentType::PickUp,
+                LazyQuestIntentType::DoQuest,
+                LazyQuestIntentType::TurnIn,
+            };
+
+            for (LazyQuestExperimentMode mode : modes)
+            {
+                for (LazyQuestIntentType type : types)
+                {
+                    IntentMetrics const& metrics =
+                        _intentMetrics[ExperimentModeIndex(mode)][IntentTypeIndex(type)];
+                    if (!metrics.HasData())
+                        continue;
+
+                    double const averageDistance = metrics.acquired
+                        ? static_cast<double>(metrics.distanceYards) / metrics.acquired
+                        : 0.0;
+                    double const averageDurationSeconds = metrics.Ended()
+                        ? static_cast<double>(metrics.durationMs) / metrics.Ended() / IN_MILLISECONDS
+                        : 0.0;
+
+                    LOG_INFO("playerbots",
+                             "[LQ][intent] run={} mode={} type={} acquired/progress/repoints/preemptions="
+                             "{}/{}/{}/{}, endings success/protected/lease/exhausted/hard/cancelled="
+                             "{}/{}/{}/{}/{}/{}, distance avg/max={:.1f}/{}, duration-avg={:.1f}s, "
+                             "source none/null/grind/explore/rpg/quest/other={}/{}/{}/{}/{}/{}/{}",
+                             _config.experimentRunId, ExperimentModeName(mode), IntentTypeName(type),
+                             metrics.acquired, metrics.semanticProgress, metrics.repoints, metrics.preemptions,
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::Success)],
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::ProtectedActivity)],
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::ConservativeLease)],
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::Exhausted)],
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::HardStall)],
+                             metrics.endings[static_cast<std::size_t>(IntentEndReason::Cancelled)],
+                             averageDistance, metrics.maxDistanceYards, averageDurationSeconds,
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::None)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Null)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Grind)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Explore)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Rpg)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Quest)],
+                             metrics.previousTargets[static_cast<std::size_t>(PreviousTargetType::Other)]);
+                }
+            }
+
             _metrics = {};
+            _intentMetrics = {};
             _nextMetricsAt = now + std::chrono::milliseconds(_config.metricsIntervalMs);
         }
 
@@ -1617,6 +1901,8 @@ namespace
             _rosterSnapshot.clear();
             _rosterCursor = 0;
             _nextRosterReconcileAt = SchedulerTime::min();
+            _metrics = {};
+            _intentMetrics = {};
             _clearRequested = false;
         }
 
@@ -1632,6 +1918,7 @@ namespace
         std::mutex _pendingEventsMutex;
         std::deque<PendingBotEvent> _pendingEvents;
         SchedulerMetrics _metrics;
+        std::array<std::array<IntentMetrics, INTENT_TYPE_COUNT>, EXPERIMENT_MODE_COUNT> _intentMetrics{};
         SchedulerTime _nextIndexAttempt = SchedulerTime::min();
         SchedulerTime _nextMetricsAt = SchedulerTime::max();
         SchedulerTime _nextRosterReconcileAt = SchedulerTime::min();
@@ -1724,6 +2011,50 @@ namespace
             MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.lootEvents; });
         }
 
+        void RecordLootItem(Player* player, Item* item)
+        {
+            ItemTemplate const* itemTemplate = item ? item->GetTemplate() : nullptr;
+            uint32 const itemLevel = itemTemplate ? itemTemplate->ItemLevel : 0;
+            bool const isGear = itemTemplate && itemTemplate->InventoryType != INVTYPE_NON_EQUIP;
+            MutatePending(player, [itemLevel, isGear](FlightRecorderPending& pending)
+            {
+                ++pending.counters.lootItems;
+                if (isGear)
+                {
+                    ++pending.counters.lootGearItems;
+                    pending.counters.lootGearItemLevels += itemLevel;
+                }
+            });
+        }
+
+        void RecordQuestRewardItem(Player* player, Item* item)
+        {
+            ItemTemplate const* itemTemplate = item ? item->GetTemplate() : nullptr;
+            if (!itemTemplate || itemTemplate->InventoryType == INVTYPE_NON_EQUIP)
+                return;
+
+            uint32 const itemLevel = itemTemplate->ItemLevel;
+            MutatePending(player, [itemLevel](FlightRecorderPending& pending)
+            {
+                ++pending.counters.questRewardGearItems;
+                pending.counters.questRewardGearItemLevels += itemLevel;
+            });
+        }
+
+        void RecordEquip(Player* player, Item* item)
+        {
+            ItemTemplate const* itemTemplate = item ? item->GetTemplate() : nullptr;
+            if (!itemTemplate || itemTemplate->InventoryType == INVTYPE_NON_EQUIP)
+                return;
+
+            uint32 const itemLevel = itemTemplate->ItemLevel;
+            MutatePending(player, [itemLevel](FlightRecorderPending& pending)
+            {
+                ++pending.counters.equipEvents;
+                pending.counters.equippedEventItemLevels += itemLevel;
+            });
+        }
+
         void RecordQuestPickup(Player* player)
         {
             MutatePending(player, [](FlightRecorderPending& pending) { ++pending.counters.questPickups; });
@@ -1804,6 +2135,37 @@ namespace
         static std::size_t ActivityIndex(RecordedActivity activity)
         {
             return static_cast<std::size_t>(activity);
+        }
+
+        void ObserveEquipment(Player* player, FlightRecorderBotState& state) const
+        {
+            uint32 totalItemLevel = 0;
+            uint32 occupiedSlots = 0;
+            uint32 weaponItemLevel = 0;
+
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                ItemTemplate const* itemTemplate = item ? item->GetTemplate() : nullptr;
+                if (!itemTemplate)
+                    continue;
+
+                ++occupiedSlots;
+                totalItemLevel += itemTemplate->ItemLevel;
+                if (slot == EQUIPMENT_SLOT_MAINHAND || slot == EQUIPMENT_SLOT_RANGED)
+                    weaponItemLevel = std::max(weaponItemLevel, itemTemplate->ItemLevel);
+            }
+
+            uint32 const averageItemLevel = occupiedSlots
+                ? (totalItemLevel + occupiedSlots / 2) / occupiedSlots
+                : 0;
+
+            ++state.counters.gearSamples;
+            state.counters.sampledLevels += player->GetLevel();
+            state.counters.sampledAverageItemLevels += averageItemLevel;
+            state.counters.sampledTotalItemLevels += totalItemLevel;
+            state.counters.sampledOccupiedSlots += occupiedSlots;
+            state.counters.sampledWeaponItemLevels += weaponItemLevel;
         }
 
         uint32 GetQuestProgressValue(QuestStatusData const& status) const
@@ -2052,6 +2414,7 @@ namespace
                 AccrueActivity(state, now);
                 ObserveQuestProgress(player, state);
                 UpdateIntentSnapshot(player, state);
+                ObserveEquipment(player, state);
                 state.lastActivity = ClassifyActivity(player);
             }
         }
@@ -2088,11 +2451,12 @@ namespace
                     continue;
 
                 LOG_INFO("playerbots",
-                         "[LQ][flight] mode={} bots={} xp total/kill/quest/explore/other={}/{}/{}/{}/{}, "
+                         "[LQ][flight] run={} mode={} bots={} xp total/kill/quest/explore/other={}/{}/{}/{}/{}, "
                          "activity-s travel/fight/loot/interact/service/dead/idle={}/{}/{}/{}/{}/{}/{}, "
                          "events kills/deaths/loot/pickups/objective-deltas/completions/turn-ins/levels="
                          "{}/{}/{}/{}/{}/{}/{}/{}, intents={}",
-                         ExperimentModeName(mode), botCounts[modeIndex], counters.TotalXp(), counters.xpKill,
+                         _config.experimentRunId, ExperimentModeName(mode), botCounts[modeIndex],
+                         counters.TotalXp(), counters.xpKill,
                          counters.xpQuest, counters.xpExplore, counters.xpOther,
                          counters.activityMs[ActivityIndex(RecordedActivity::Travelling)] / IN_MILLISECONDS,
                          counters.activityMs[ActivityIndex(RecordedActivity::Fighting)] / IN_MILLISECONDS,
@@ -2104,6 +2468,35 @@ namespace
                          counters.kills, counters.deaths, counters.lootEvents, counters.questPickups,
                          counters.objectiveDeltas, counters.questCompletions, counters.questTurnIns,
                          counters.levelUps, intentCounts[modeIndex]);
+
+                double const averageLevel = counters.gearSamples
+                    ? static_cast<double>(counters.sampledLevels) / counters.gearSamples
+                    : 0.0;
+                double const averageItemLevel = counters.gearSamples
+                    ? static_cast<double>(counters.sampledAverageItemLevels) / counters.gearSamples
+                    : 0.0;
+                double const averageTotalItemLevel = counters.gearSamples
+                    ? static_cast<double>(counters.sampledTotalItemLevels) / counters.gearSamples
+                    : 0.0;
+                double const averageOccupiedSlots = counters.gearSamples
+                    ? static_cast<double>(counters.sampledOccupiedSlots) / counters.gearSamples
+                    : 0.0;
+                double const averageWeaponItemLevel = counters.gearSamples
+                    ? static_cast<double>(counters.sampledWeaponItemLevels) / counters.gearSamples
+                    : 0.0;
+
+                LOG_INFO("playerbots",
+                         "[LQ][gear] run={} mode={} bots={} samples={} "
+                         "snapshot level/avg-ilvl/total-ilvl/slots/weapon-ilvl="
+                         "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}, "
+                         "items loot/loot-gear/quest-gear/equips={}/{}/{}/{}, "
+                         "item-level-sums loot-gear/quest-gear/equips={}/{}/{}",
+                         _config.experimentRunId, ExperimentModeName(mode), botCounts[modeIndex],
+                         counters.gearSamples, averageLevel, averageItemLevel, averageTotalItemLevel,
+                         averageOccupiedSlots, averageWeaponItemLevel, counters.lootItems,
+                         counters.lootGearItems, counters.questRewardGearItems, counters.equipEvents,
+                         counters.lootGearItemLevels, counters.questRewardGearItemLevels,
+                         counters.equippedEventItemLevels);
             }
 
             _carried = {};
@@ -2155,7 +2548,9 @@ public:
                          PLAYERHOOK_ON_CREATURE_KILL, PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
                          PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_GIVE_EXP, PLAYERHOOK_ON_LOGIN,
                          PLAYERHOOK_ON_BEFORE_LOGOUT, PLAYERHOOK_ON_MAP_CHANGED,
-                         PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, PLAYERHOOK_ON_AFTER_CREATURE_LOOT })
+                         PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, PLAYERHOOK_ON_AFTER_CREATURE_LOOT,
+                         PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_QUEST_REWARD_ITEM,
+                         PLAYERHOOK_ON_EQUIP })
     {
     }
 
@@ -2218,6 +2613,21 @@ public:
     {
         LazyQuestFlightRecorder::Instance().RecordLoot(player);
     }
+
+    void OnPlayerLootItem(Player* player, Item* item, uint32 /*count*/, ObjectGuid /*lootGuid*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordLootItem(player, item);
+    }
+
+    void OnPlayerQuestRewardItem(Player* player, Item* item, uint32 /*count*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordQuestRewardItem(player, item);
+    }
+
+    void OnPlayerEquip(Player* player, Item* item, uint8 /*bag*/, uint8 /*slot*/, bool /*update*/) override
+    {
+        LazyQuestFlightRecorder::Instance().RecordEquip(player, item);
+    }
 };
 
 class LazyQuestingWorldScript final : public WorldScript
@@ -2237,11 +2647,13 @@ public:
         LazyQuestFlightRecorder::Instance().Configure(config);
         LOG_INFO("server.loading",
                   "mod-lazy-questing config: enabled={}, budget={}ms, active={}ms, discovery={}..{}ms, "
-                  "per-tick active/discovery={}/{}, experiment seed={}, control/assist/current={}/{}/{}%, "
+                  "per-tick active/discovery={}/{}, experiment run={} seed={}, "
+                  "control/assist/current={}/{}/{}%, "
                   "flight-recorder={} sample/metrics={}/{}ms.",
                   config.enabled, config.worldBudgetMs, config.activeCheckIntervalMs,
                   config.discoveryIntervalMs, config.maxDiscoveryBackoffMs,
-                  config.maxActiveBotsPerTick, config.maxDiscoveryBotsPerTick, config.experimentSeed,
+                  config.maxActiveBotsPerTick, config.maxDiscoveryBotsPerTick, config.experimentRunId,
+                  config.experimentSeed,
                   config.experimentControlPercent, config.experimentAssistOnlyPercent,
                   100 - config.experimentControlPercent - config.experimentAssistOnlyPercent,
                   config.flightRecorderEnabled, config.flightRecorderSampleIntervalMs,

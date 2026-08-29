@@ -544,7 +544,8 @@ bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, L
 
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds,
-                            LazyQuestSelectionStats* stats, bool allowQuestWork)
+                            LazyQuestSelectionStats* stats, bool allowQuestWork,
+                            float maxTurnInDistance, float maxPickupDistance)
 {
     if (!bot || !pickupIndexReady)
         return false;
@@ -580,7 +581,7 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                     continue;
 
                 WorldPosition* point =
-                    FindNearestDestinationPointOnMap(destination, botPosition, MAX_QUEST_DISTANCE);
+                    FindNearestDestinationPointOnMap(destination, botPosition, maxTurnInDistance);
                 if (!point)
                     continue;
 
@@ -616,7 +617,9 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
 
     if (activeQuestCount < DESIRED_ACTIVE_QUESTS)
     {
-        float const pickupSearchDistance = 400.0f + bot->GetLevel() * 10.0f;
+        float const pickupSearchDistance = maxPickupDistance > 0.0f
+            ? maxPickupDistance
+            : 400.0f + bot->GetLevel() * 10.0f;
         int32 const cellRadius =
             static_cast<int32>(std::ceil(pickupSearchDistance / PICKUP_INDEX_CELL_SIZE));
         PickupIndexCell const center = GetCell(botPosition);
@@ -705,7 +708,7 @@ bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
 bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
                       TravelDestination* preferredDestination,
                       std::vector<WorldPosition*> const& excludedPoints,
-                      LazyQuestCandidate& candidate)
+                      LazyQuestCandidate& candidate, float maxDistance)
 {
     if (!bot || !pickupIndexReady || !questId)
         return false;
@@ -720,7 +723,7 @@ bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
             return;
 
         float const distance = point->distance(botPosition);
-        if (distance > MAX_QUEST_DISTANCE || (found && distance >= best.distance))
+        if (distance > maxDistance || (found && distance >= best.distance))
             return;
 
         best = { destination, point, questId, type, distance };
@@ -740,7 +743,7 @@ bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
                 continue;
 
             WorldPosition* point = FindNearestSpawnOnMap(
-                objective.entry, botPosition, MAX_QUEST_DISTANCE, &excludedPoints, true);
+                objective.entry, botPosition, maxDistance, &excludedPoints, true);
             consider(destination, point);
         }
     }
@@ -757,7 +760,7 @@ bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
                 continue;
 
             WorldPosition* point = FindNearestDestinationPointOnMap(
-                destination, botPosition, MAX_QUEST_DISTANCE, &excludedPoints);
+                destination, botPosition, maxDistance, &excludedPoints);
             consider(destination, point);
         }
     }

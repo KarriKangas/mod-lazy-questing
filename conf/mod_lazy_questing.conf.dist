@@ -28,6 +28,7 @@ LazyQuesting.MetricsIntervalMs = 60000
 # For a control-versus-assist experiment, set both percentages to 50. Change the seed to create a new
 # assignment; keep it fixed throughout an experiment. ControlPercent + AssistOnlyPercent may not
 # exceed 100 (AssistOnlyPercent is clamped to the remaining percentage).
+LazyQuesting.Experiment.RunId = unassigned
 LazyQuesting.Experiment.Seed = 1
 LazyQuesting.Experiment.ControlPercent = 0
 LazyQuesting.Experiment.AssistOnlyPercent = 0

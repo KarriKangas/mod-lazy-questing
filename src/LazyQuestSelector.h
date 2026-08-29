@@ -47,11 +47,14 @@ LazyQuestIndexStats GetLazyQuestIndexStats();
 bool FindLazyQuestCandidate(Player* bot, LazyQuestCandidate& candidate,
                             std::unordered_set<uint32> const* excludedQuestIds = nullptr,
                             LazyQuestSelectionStats* stats = nullptr,
-                            bool allowQuestWork = true);
+                            bool allowQuestWork = true,
+                            float maxTurnInDistance = 2500.0f,
+                            float maxPickupDistance = 0.0f);
 bool FindLazyQuestLeg(Player* bot, uint32 questId, LazyQuestIntentType type,
                       TravelDestination* preferredDestination,
                       std::vector<WorldPosition*> const& excludedPoints,
-                      LazyQuestCandidate& candidate);
+                      LazyQuestCandidate& candidate,
+                      float maxDistance = 2500.0f);
 bool IsLazyQuestDestinationActive(Player* bot, TravelDestination* destination, LazyQuestIntentType type);
 
 #endif

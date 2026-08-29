@@ -33,7 +33,10 @@ spawns instead of concentrating it at a random point.
 Strict Altbots can be assigned deterministically to three experiment modes:
 
 - `control`, which is never touched by Lazy Questing;
-- `assist-only`, which permits quest pickup and turn-in but no objective routing;
+- `assist-only`, the conservative treatment: it permits only pickup within 200 yards and turn-in
+  within 250 yards, never routes to objectives, never replaces active grinding or RPG activity,
+  yields to pending loot, keeps `new rpg` enabled, and releases its short movement lease after at
+  most one minute;
 - `current`, which retains the module's complete current behavior.
 
 The configured control and assist percentages use a stable hash of character
@@ -50,6 +53,12 @@ five-second sample attributes time to travel, combat, looting, interaction,
 service, death/corpse-running, or idle activity. Once per minute these
 measurements are emitted as one aggregate log line per experiment mode; no
 per-event or per-bot log stream is produced.
+
+Each experiment has a configured run identifier included in scheduler, intent, flight, and gear
+lines. Intent aggregates include type, acquisition distance, previous target category, progress,
+preemption, outcome, and duration. Gear aggregates include same-window character level, populated
+slot item level, total equipped item-level points, occupied slots, weapon item level, loot gear,
+quest-reward gear, and equip events.
 
 ## Requirements
 
