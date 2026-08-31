@@ -80,6 +80,7 @@ namespace
         uint32 experimentSeed = 1;
         uint32 experimentControlPercent = 0;
         uint32 experimentAssistOnlyPercent = 0;
+        bool assistAtomicQuestInteractions = false;
         bool flightRecorderEnabled = true;
         uint32 flightRecorderSampleIntervalMs = 5 * IN_MILLISECONDS;
         uint32 flightRecorderMetricsIntervalMs = MINUTE * IN_MILLISECONDS;
@@ -117,6 +118,8 @@ namespace
         config.experimentAssistOnlyPercent = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.Experiment.AssistOnlyPercent", 0), 0,
             100 - config.experimentControlPercent);
+        config.assistAtomicQuestInteractions = sConfigMgr->GetOption<bool>(
+            "LazyQuesting.Assist.AtomicQuestInteractions", false);
         config.flightRecorderEnabled = sConfigMgr->GetOption<bool>("LazyQuesting.FlightRecorder.Enable", true);
         config.flightRecorderSampleIntervalMs = ClampConfig(
             sConfigMgr->GetOption<uint32>("LazyQuesting.FlightRecorder.SampleIntervalMs", 5000), 1000, 60000);
@@ -763,11 +766,9 @@ namespace
         return std::min<uint32>(QUEST_INTERACTION_RETRY_MIN_MS << shift, QUEST_INTERACTION_RETRY_MAX_MS);
     }
 
-    bool TryQuestInteraction(Player* bot, PlayerbotAI* botAI, LazyQuestIntent& intent,
-                             TravelTarget* current, uint32 nowMs)
+    bool TryQuestInteraction(Player* bot, PlayerbotAI* botAI, LazyQuestIntent& intent, uint32 nowMs)
     {
-        if (intent.type == LazyQuestIntentType::DoQuest || !current ||
-            current->getDestination() != intent.destination ||
+        if (intent.type == LazyQuestIntentType::DoQuest ||
             (intent.lastInteractionAtMs != 0 &&
              getMSTimeDiff(intent.lastInteractionAtMs, nowMs) < GetInteractionRetryMs(intent)))
             return false;
@@ -805,6 +806,15 @@ namespace
         LOG_DEBUG("playerbots", "[LQ] {} {} {} quest {} interaction", bot->GetName(),
                   completed ? "completed" : "attempted", IntentTypeName(intent.type), intent.questId);
         return completed;
+    }
+
+    bool TryQuestInteraction(Player* bot, PlayerbotAI* botAI, LazyQuestIntent& intent,
+                             TravelTarget* current, uint32 nowMs)
+    {
+        if (!current || current->getDestination() != intent.destination)
+            return false;
+
+        return TryQuestInteraction(bot, botAI, intent, nowMs);
     }
 
     void AddQuestCooldown(LazyBotState& state, uint32 questId, SchedulerTime now, uint32 cooldownMs)
@@ -910,6 +920,19 @@ namespace
         uint64 preemptions = 0;
         uint64 exhaustedIntents = 0;
         uint64 hardStalls = 0;
+        uint64 atomicScansDue = 0;
+        uint64 atomicUnavailable = 0;
+        uint64 atomicDisabled = 0;
+        uint64 atomicBlockedLoot = 0;
+        uint64 atomicBlockedService = 0;
+        uint64 atomicRpgActive = 0;
+        uint64 atomicRpgMatched = 0;
+        uint64 atomicRpgMismatch = 0;
+        uint64 atomicSelectorRuns = 0;
+        uint64 atomicNoCandidate = 0;
+        uint64 atomicCandidates = 0;
+        uint64 atomicAttempts = 0;
+        uint64 atomicSuccesses = 0;
     };
 
     enum class IntentEndReason : uint8
@@ -1090,7 +1113,8 @@ namespace
             bool const experimentChanged = _config.experimentRunId != config.experimentRunId ||
                 _config.experimentSeed != config.experimentSeed ||
                 _config.experimentControlPercent != config.experimentControlPercent ||
-                _config.experimentAssistOnlyPercent != config.experimentAssistOnlyPercent;
+                _config.experimentAssistOnlyPercent != config.experimentAssistOnlyPercent ||
+                _config.assistAtomicQuestInteractions != config.assistAtomicQuestInteractions;
             _config = config;
 
             if (wasEnabled && !_config.enabled)
@@ -1184,10 +1208,14 @@ namespace
 
         LazyQuestingScheduler() = default;
 
+        IntentMetrics& MetricsFor(LazyQuestExperimentMode mode, LazyQuestIntentType type)
+        {
+            return _intentMetrics[ExperimentModeIndex(mode)][IntentTypeIndex(type)];
+        }
+
         IntentMetrics& MetricsFor(LazyBotState const& state)
         {
-            return _intentMetrics[ExperimentModeIndex(state.experimentMode)]
-                                 [IntentTypeIndex(state.intent.type)];
+            return MetricsFor(state.experimentMode, state.intent.type);
         }
 
         void RecordIntentAcquired(LazyBotState const& state)
@@ -1208,6 +1236,25 @@ namespace
             IntentMetrics& metrics = MetricsFor(state);
             ++metrics.endings[static_cast<std::size_t>(reason)];
             metrics.durationMs += getMSTimeDiff(state.intent.startedAtMs, nowMs);
+        }
+
+        void RecordAtomicInteraction(LazyBotState const& state, LazyQuestCandidate const& candidate,
+                                     TravelTarget* preservedTarget, bool succeeded)
+        {
+            IntentMetrics& metrics = MetricsFor(state.experimentMode, candidate.type);
+            ++metrics.acquired;
+            uint64 const distance = static_cast<uint64>(std::max(0.0f, candidate.distance));
+            metrics.distanceYards += distance;
+            metrics.maxDistanceYards = std::max(metrics.maxDistanceYards, distance);
+            ++metrics.previousTargets[static_cast<std::size_t>(ClassifyPreviousTarget(preservedTarget))];
+            ++metrics.endings[static_cast<std::size_t>(
+                succeeded ? IntentEndReason::Success : IntentEndReason::Cancelled)];
+
+            if (succeeded)
+            {
+                ++metrics.semanticProgress;
+                ++_metrics.semanticProgress;
+            }
         }
 
         bool DidIntentSucceed(Player* player, LazyQuestIntent const& intent) const
@@ -1734,15 +1781,48 @@ namespace
                 return;
             }
 
+            bool const atomicAssist = state.experimentMode == LazyQuestExperimentMode::AssistOnly;
+            if (atomicAssist)
+                ++_metrics.atomicScansDue;
+
             if (IsTemporarilyUnavailable(player))
             {
+                if (atomicAssist)
+                    ++_metrics.atomicUnavailable;
                 Schedule(guid, state, ScheduleLane::Discovery,
                          now + std::chrono::milliseconds(TRANSIENT_RETRY_MS));
                 return;
             }
 
             TravelTarget* current = botAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
-            if (!ShouldNudge(player, botAI, current))
+            if (atomicAssist && !_config.assistAtomicQuestInteractions)
+            {
+                ++_metrics.atomicDisabled;
+                state.consecutiveDiscoveryMisses = 0;
+                Schedule(guid, state, ScheduleLane::Discovery,
+                         now + std::chrono::milliseconds(_config.maxDiscoveryBackoffMs));
+                return;
+            }
+
+            bool const hasAvailableLoot = atomicAssist && HasAvailableLoot(botAI);
+            bool const hasEssentialService = atomicAssist && HasEssentialRpgNeed(botAI);
+            bool const hasRpgActivity = atomicAssist && HasProtectedRpgActivity(botAI);
+            if (hasRpgActivity)
+                ++_metrics.atomicRpgActive;
+
+            if (atomicAssist && (hasAvailableLoot || hasEssentialService))
+            {
+                if (hasAvailableLoot)
+                    ++_metrics.atomicBlockedLoot;
+                if (hasEssentialService)
+                    ++_metrics.atomicBlockedService;
+                state.consecutiveDiscoveryMisses = 0;
+                Schedule(guid, state, ScheduleLane::Discovery,
+                         now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
+                return;
+            }
+
+            if (!atomicAssist && !ShouldNudge(player, botAI, current))
             {
                 state.consecutiveDiscoveryMisses = 0;
                 Schedule(guid, state, ScheduleLane::Discovery,
@@ -1755,11 +1835,10 @@ namespace
             LazyQuestSelectionStats selectionStats;
             SchedulerTime const selectionStart = SchedulerClock::now();
             bool const allowQuestWork = state.experimentMode == LazyQuestExperimentMode::Current;
-            bool const conservativeAssist = state.experimentMode == LazyQuestExperimentMode::AssistOnly;
             bool const found = FindLazyQuestCandidate(player, candidate, &coolingDown, &selectionStats,
                                                       allowQuestWork,
-                                                      conservativeAssist ? CONSERVATIVE_TURN_IN_DISTANCE : 2500.0f,
-                                                      conservativeAssist ? CONSERVATIVE_PICKUP_DISTANCE : 0.0f);
+                                                      atomicAssist ? INTERACTION_DISTANCE : 2500.0f,
+                                                      atomicAssist ? INTERACTION_DISTANCE : 0.0f);
             uint64 const selectionMicros = static_cast<uint64>(std::chrono::duration_cast<std::chrono::microseconds>(
                 SchedulerClock::now() - selectionStart).count());
 
@@ -1769,13 +1848,76 @@ namespace
             _metrics.indexedPointsVisited += selectionStats.indexedPointsVisited;
             _metrics.pickupDestinationsEvaluated += selectionStats.pickupDestinationsEvaluated;
             _metrics.candidatesFound += selectionStats.candidatesFound;
-
-            if (!found || !current)
+            if (atomicAssist)
             {
-                if (state.consecutiveDiscoveryMisses < 255)
+                ++_metrics.atomicSelectorRuns;
+                if (found)
+                    ++_metrics.atomicCandidates;
+                else
+                    ++_metrics.atomicNoCandidate;
+            }
+
+            if (!found || (!atomicAssist && !current))
+            {
+                if (atomicAssist)
+                    state.consecutiveDiscoveryMisses = 0;
+                else if (state.consecutiveDiscoveryMisses < 255)
                     ++state.consecutiveDiscoveryMisses;
                 Schedule(guid, state, ScheduleLane::Discovery,
-                         now + std::chrono::milliseconds(GetDiscoveryDelayMs(guid, state)));
+                         now + std::chrono::milliseconds(atomicAssist
+                             ? _config.activeCheckIntervalMs
+                             : GetDiscoveryDelayMs(guid, state)));
+                return;
+            }
+
+            if (atomicAssist)
+            {
+                if (hasRpgActivity)
+                {
+                    auto* relation = dynamic_cast<QuestRelationTravelDestination*>(candidate.destination);
+                    GuidPosition rpgTarget = botAI->GetAiObjectContext()
+                        ->GetValue<GuidPosition>("rpg target")->Get();
+                    int32 const relationEntry = relation ? relation->getEntry() : 0;
+                    uint32 const expectedEntry = relationEntry < 0
+                        ? static_cast<uint32>(-relationEntry)
+                        : static_cast<uint32>(relationEntry);
+                    bool const sameRpgTarget = relation && candidate.point && rpgTarget && expectedEntry &&
+                        rpgTarget.GetEntry() == expectedEntry &&
+                        rpgTarget.GetMapId() == candidate.point->GetMapId() &&
+                        rpgTarget.sqDistance2d(candidate.point) <= 4.0f;
+                    if (!sameRpgTarget)
+                    {
+                        ++_metrics.atomicRpgMismatch;
+                        state.consecutiveDiscoveryMisses = 0;
+                        Schedule(guid, state, ScheduleLane::Discovery,
+                                 now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
+                        return;
+                    }
+
+                    ++_metrics.atomicRpgMatched;
+                }
+
+                LazyQuestIntent interaction;
+                interaction.questId = candidate.questId;
+                interaction.type = candidate.type;
+                interaction.destination = candidate.destination;
+                interaction.point = candidate.point;
+
+                bool const attempted = TryQuestInteraction(player, botAI, interaction, getMSTime());
+                bool const succeeded = attempted && DidIntentSucceed(player, interaction);
+                if (attempted)
+                    ++_metrics.atomicAttempts;
+                if (succeeded)
+                    ++_metrics.atomicSuccesses;
+                RecordAtomicInteraction(state, candidate, current, succeeded);
+                state.consecutiveDiscoveryMisses = 0;
+
+                LOG_DEBUG("playerbots",
+                          "[LQ] {} {} atomic {} quest {} at {:.1f}y without changing travel target",
+                          player->GetName(), succeeded ? "completed" : "attempted",
+                          IntentTypeName(candidate.type), candidate.questId, candidate.distance);
+                Schedule(guid, state, ScheduleLane::Discovery,
+                         now + std::chrono::milliseconds(_config.activeCheckIntervalMs));
                 return;
             }
 
@@ -1813,7 +1955,9 @@ namespace
                      "intents={}, queues={}/{}, "
                      "processed={}/{}, registrations={}/{}/{}, progress/repoints/preemptions={}/{}/{}, "
                      "exhausted/hard-stalls={}/{}, selector avg/max={:.0f}/{}us, "
-                     "indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}",
+                     "indexed/evaluated/candidates={}/{}/{}, budget-limited ticks={}, "
+                     "atomic scans/unavailable/disabled/loot/service/rpg-active/rpg-match/rpg-mismatch/"
+                     "selector/no-candidate/candidate/attempt/success={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                      _config.experimentRunId, sStrictAltbotMgr->GetRosterSize(), _states.size(),
                      _registrationRetries.size(),
                      _controlBots.size(), assistOnlyBots, currentBots,
@@ -1824,7 +1968,11 @@ namespace
                      _metrics.preemptions, _metrics.exhaustedIntents, _metrics.hardStalls,
                      averageDiscoveryMicros, _metrics.discoveryMaxMicros, _metrics.indexedPointsVisited,
                      _metrics.pickupDestinationsEvaluated, _metrics.candidatesFound,
-                     _metrics.budgetLimitedTicks);
+                     _metrics.budgetLimitedTicks, _metrics.atomicScansDue, _metrics.atomicUnavailable,
+                     _metrics.atomicDisabled, _metrics.atomicBlockedLoot, _metrics.atomicBlockedService,
+                     _metrics.atomicRpgActive, _metrics.atomicRpgMatched, _metrics.atomicRpgMismatch,
+                     _metrics.atomicSelectorRuns, _metrics.atomicNoCandidate, _metrics.atomicCandidates,
+                     _metrics.atomicAttempts, _metrics.atomicSuccesses);
 
             std::array<LazyQuestExperimentMode, EXPERIMENT_MODE_COUNT> const modes = {
                 LazyQuestExperimentMode::Control,
@@ -2648,7 +2796,7 @@ public:
         LOG_INFO("server.loading",
                   "mod-lazy-questing config: enabled={}, budget={}ms, active={}ms, discovery={}..{}ms, "
                   "per-tick active/discovery={}/{}, experiment run={} seed={}, "
-                  "control/assist/current={}/{}/{}%, "
+                  "control/assist/current={}/{}/{}%, assist atomic={}, "
                   "flight-recorder={} sample/metrics={}/{}ms.",
                   config.enabled, config.worldBudgetMs, config.activeCheckIntervalMs,
                   config.discoveryIntervalMs, config.maxDiscoveryBackoffMs,
@@ -2656,6 +2804,7 @@ public:
                   config.experimentSeed,
                   config.experimentControlPercent, config.experimentAssistOnlyPercent,
                   100 - config.experimentControlPercent - config.experimentAssistOnlyPercent,
+                  config.assistAtomicQuestInteractions,
                   config.flightRecorderEnabled, config.flightRecorderSampleIntervalMs,
                   config.flightRecorderMetricsIntervalMs);
     }

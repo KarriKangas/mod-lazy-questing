@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "run_id": "cohort-10-conservative-assist-vs-control",
+  "recorder_epoch_start": "2026-08-29T12:01:07+03:00",
+  "checkpoint_time": "2026-08-29T16:19:00+03:00",
+  "retained_intervals": 261,
+  "retained_line_span": [11081, 39314],
+  "exclusions": [
+    {
+      "count": 1,
+      "reason": "startup fragment excluded before aggregation"
+    }
+  ],
+  "provenance": "Exact-run analyzer output captured read-only before the external restart reset Playerbots.log. The original raw epoch could not be recovered. loot_items was not retained in the checkpoint output and is explicitly null.",
+  "intent_audit": {
+    "assessment": "failed",
+    "acquired": 10,
+    "pickup_acquired": 3,
+    "turn_in_acquired": 7,
+    "successful": 1,
+    "protected": 9,
+    "lease_expirations": 0,
+    "exhausted": 0,
+    "hard_stalls": 0,
+    "reason": "Nine of ten retained acquisitions yielded to protected RPG activity within roughly 5-10 seconds. The only success was an already in-range one-yard turn-in."
+  },
+  "arms": {
+    "control": {
+      "intervals": 261,
+      "bot_seconds": 626303,
+      "totals": {
+        "xp": 693643,
+        "kill_xp": 599508,
+        "quest_xp": 80005,
+        "explore_xp": 14130,
+        "other_xp": 0,
+        "travel_s": 130038,
+        "fight_s": 171163,
+        "loot_s": 59994,
+        "interact_s": 2170,
+        "service_s": 0,
+        "dead_s": 9029,
+        "idle_s": 253909,
+        "kills": 12872,
+        "deaths": 632,
+        "loot_events": 5542,
+        "quest_pickups": 545,
+        "objective_deltas": 1819,
+        "quest_completions": 307,
+        "quest_turn_ins": 285,
+        "level_ups": 235,
+        "loot_items": null,
+        "loot_gear": 659,
+        "quest_gear": 112,
+        "equip_events": 278,
+        "loot_gear_ilvl_sum": 2773,
+        "quest_gear_ilvl_sum": 588,
+        "equip_ilvl_sum": 1349
+      }
+    },
+    "assist-only": {
+      "intervals": 261,
+      "bot_seconds": 626322,
+      "totals": {
+        "xp": 689326,
+        "kill_xp": 600916,
+        "quest_xp": 76030,
+        "explore_xp": 12380,
+        "other_xp": 0,
+        "travel_s": 128059,
+        "fight_s": 165606,
+        "loot_s": 64232,
+        "interact_s": 2407,
+        "service_s": 0,
+        "dead_s": 9206,
+        "idle_s": 256812,
+        "kills": 13045,
+        "deaths": 636,
+        "loot_events": 5587,
+        "quest_pickups": 497,
+        "objective_deltas": 1603,
+        "quest_completions": 276,
+        "quest_turn_ins": 270,
+        "level_ups": 229,
+        "loot_items": null,
+        "loot_gear": 642,
+        "quest_gear": 103,
+        "equip_events": 249,
+        "loot_gear_ilvl_sum": 2648,
+        "quest_gear_ilvl_sum": 525,
+        "equip_ilvl_sum": 1136
+      }
+    }
+  }
+}

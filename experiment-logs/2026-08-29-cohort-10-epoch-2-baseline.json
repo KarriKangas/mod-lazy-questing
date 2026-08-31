@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "run_id": "cohort-10-conservative-assist-vs-control",
+  "checked_at": "2026-08-29T20:00:17.2873522+03:00",
+  "worldserver": {
+    "pid": 25380,
+    "start_time": "2026-08-29T19:47:59.4370053+03:00"
+  },
+  "durable_minimum_seconds_without_zurmos": 15956,
+  "retained_intervals": 9,
+  "retained_line_span": [14390, 18020],
+  "expected_bots_per_arm": 40,
+  "observed_bot_seconds": {
+    "control": 21592,
+    "assist-only": 21590
+  },
+  "provenance": "Read-only durable summary and exact-run recorder analysis captured together. Each later retained interval must contain scheduler mode counts 40/40 plus flight and gear bot counts 40/40. The conservative exposure floor advances by the smaller arm's additional observed activity seconds divided by 40; variable 440/480 gear sample counts are retained rather than misclassified as incomplete."
+}

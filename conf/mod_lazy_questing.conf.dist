@@ -33,6 +33,10 @@ LazyQuesting.Experiment.Seed = 1
 LazyQuesting.Experiment.ControlPercent = 0
 LazyQuesting.Experiment.AssistOnlyPercent = 0
 
+# AtomicQuestInteractions performs only an already-in-range pickup or turn-in and never changes a
+# target, routes toward quest work, or modifies combat, XP, loot, or equipment mechanics.
+LazyQuesting.Assist.AtomicQuestInteractions = 0
+
 # Low-overhead measurement for every online strict Altbot, including the control cohort. Exact XP and
 # discrete gameplay events are captured from PlayerScript hooks. Activity, objective progress, and
 # quest-completion transitions are sampled, kept in bounded per-bot memory, and emitted as one

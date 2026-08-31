@@ -4,6 +4,11 @@ An AzerothCore module for lazy questing behavior for active strict Altbots,
 powered by [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots)
 and mod-strict-altbot-guild.
 
+The evidence-based forward experiment program is documented in
+[no-cheat-progression-roadmap.md](no-cheat-progression-roadmap.md). It treats normal game mechanics
+as a hard boundary: future improvements may change bot decisions and timing, but never character
+power, XP, generated loot, movement rules, or other gameplay rewards.
+
 The module periodically finds the nearest active quest destination for
 out-of-combat Playerbots registered in the mod-strict-altbot-guild roster and
 can replace idle, grinding, exploring, or nonessential RPG travel with focused
@@ -33,10 +38,9 @@ spawns instead of concentrating it at a random point.
 Strict Altbots can be assigned deterministically to three experiment modes:
 
 - `control`, which is never touched by Lazy Questing;
-- `assist-only`, the conservative treatment: it permits only pickup within 200 yards and turn-in
-  within 250 yards, never routes to objectives, never replaces active grinding or RPG activity,
-  yields to pending loot, keeps `new rpg` enabled, and releases its short movement lease after at
-  most one minute;
+- `assist-only`, a component-test arm. Atomic quest interactions can scan only within interaction
+  distance for an immediate pickup or turn-in without acquiring an intent or changing the travel
+  target;
 - `current`, which retains the module's complete current behavior.
 
 The configured control and assist percentages use a stable hash of character
@@ -78,6 +82,8 @@ as bot counts grow:
   are logged once per minute.
 - experiment assignments remain stable across restarts and are included in the
   aggregate scheduler metrics.
+- assist-only atomic quest interactions are disabled by default and can be enabled explicitly for
+  a reviewed component test.
 - flight-recorder activity is sampled every 5 seconds and its counters are
   aggregated once per minute by experiment mode.
 
