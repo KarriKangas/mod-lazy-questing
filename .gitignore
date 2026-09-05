@@ -1,2 +1,3 @@
-__pycache__/
-*.py[cod]
+# Local build and runtime artifacts
+/build/
+*.log
