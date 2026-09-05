@@ -10,6 +10,8 @@ Design and inert module skeleton only. No new character controller is implemente
 
 Read [DESIGN.md](DESIGN.md) for the architecture and first milestone, and [AGENTS.md](AGENTS.md) for development rules.
 
+The [accelerated bot laboratory](sandbox/README.md) provides an isolated headless test server at `D:\wowbot-lab`, with separate databases, launchers, and a simulation clock. It exercises strict Playerbots while the new controller is being developed.
+
 ## Previous project
 
 The previous implementation, configuration defaults, reports, instructions, and uncommitted work were preserved in [the legacy snapshot](archive/lazy-questing-2026-09-05.zip). See [archive/README.md](archive/README.md) for verification and recovery. Git history is retained.

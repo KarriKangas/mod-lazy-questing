@@ -25,6 +25,10 @@ The live configuration, when applicable, is under `D:\wowserver\build\bin\RelWit
 
 Run checks appropriate to code changes. Documentation-only changes do not require a server build. Never claim a build or runtime validation that did not complete.
 
+## Accelerated sandbox
+
+For laboratory work use `sandbox/BuildLab.ps1`, not the normal server build command above. The lab's source snapshot, build, data, databases, executable, and logs live at `D:\wowbot-lab`. Read `sandbox/README.md` before operating it. Never modify `StartServer.bat`, `WorldserverLoop.bat`, the live configuration, or the WoW client as part of sandbox work. Run identity/isolation checks and use the lab launcher; never stop processes by image name. Keep sandbox source overlays reproducible in this repository and raw data/credentials outside Git.
+
 ## Historical evidence
 
 The ZIP under archive/ preserves the old source, reports, reporting template, and detailed collection instructions, including previously uncommitted work. Keep it immutable. Consult it as evidence; do not compile archived source or treat prior treatments as approved.

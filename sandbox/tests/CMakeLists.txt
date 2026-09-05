@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(SandboxClockTests LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+enable_testing()
+add_executable(clock_test clock_test.cpp clock_peer.cpp)
+add_test(NAME sandbox_clock COMMAND clock_test)
+add_test(NAME sandbox_clock_future_epoch COMMAND clock_test)
+set_tests_properties(sandbox_clock_future_epoch PROPERTIES ENVIRONMENT "WOWBOT_LAB_EPOCH_NS=2000000000000000000")

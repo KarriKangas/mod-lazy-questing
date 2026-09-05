@@ -1,0 +1,47 @@
+void WorldUpdateLoop()
+{
+    // Fixed simulation steps: acceleration changes wall pacing, never game rules.
+    double speed = sConfigMgr->GetOption<float>("Sandbox.Speed", 4.0f);
+    uint32 step = sConfigMgr->GetOption<uint32>("Sandbox.StepMs", 50);
+    if (!std::isfinite(speed) || speed < 1.0 || speed > 20.0 || step != 50)
+    {
+        LOG_ERROR("server.worldserver", "Sandbox requires Speed in [1,20] and StepMs=50");
+        World::StopNow(ERROR_EXIT_CODE);
+        return;
+    }
+
+    SandboxClock::Start();
+    auto started = std::chrono::steady_clock::now();
+    auto deadline = started;
+    auto lastReport = started;
+    auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double, std::milli>(step / speed));
+    uint64 ticks = 0;
+    uint64 previousTicks = 0;
+    LOG_INFO("server.worldserver", "[SANDBOX] speed={} fixed_step_ms={} headless isolated simulation", speed, step);
+    while (!World::IsStopped())
+    {
+        ++World::m_worldLoopCounter;
+        SandboxClock::Advance(Milliseconds(step));
+        sWorld->Update(step);
+        ++ticks;
+        auto now = std::chrono::steady_clock::now();
+        double wall = std::chrono::duration<double>(now - lastReport).count();
+        if (wall >= 10.0)
+        {
+            LOG_INFO("server.worldserver",
+                "[SANDBOX] ticks={} simulation_ms={} wall_ms={} achieved_speed={} requested_speed={} step_ms={}",
+                ticks, ticks * step, std::chrono::duration_cast<Milliseconds>(now - started).count(),
+                ((ticks - previousTicks) * step / 1000.0) / wall, speed, step);
+            lastReport = now;
+            previousTicks = ticks;
+        }
+        deadline += period;
+        // If CPU-bound, slow wall throughput instead of increasing the simulation step.
+        if (deadline < now)
+            deadline = now;
+        std::this_thread::sleep_until(deadline);
+    }
+    LOG_INFO("server.worldserver", "[SANDBOX-CLOCK] epoch_ns={}",
+        std::chrono::duration_cast<std::chrono::nanoseconds>(SandboxClock::SystemNow().time_since_epoch()).count());
+}
